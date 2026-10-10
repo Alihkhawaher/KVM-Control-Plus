@@ -226,3 +226,57 @@ rather than leaving it to be rediscovered. See `capture_report` in `src/app.rs`.
 is a defect, not a user preference. The remaining work is to make the format list
 USB-mode-aware — offer MJPEG at the highest available rate, and mark
 uncompressed NV12/YUV as requiring USB 3.x. Tracked in `docs/TODO.md`.
+
+---
+
+## 8. Colour: what range and matrix the samples are actually in
+
+Measured on the real device, not assumed:
+
+```
+KVM-Control-Plus.exe --trace --snapshot <file> 0
+```
+
+reports the negotiated output type and the interpretation drawn from it:
+
+```
+colour: BT.709 (media type says BT.709), full 0-255 (media type says 0-255) | output type 1920x1080 stride 1920
+```
+
+| Attribute | Reported | Codes (`mfobjects.h`) |
+|---|---|---|
+| `MF_MT_VIDEO_NOMINAL_RANGE` | **1 ⇒ full 0–255** | 1 = `MFNominalRange_0_255`, 2 = `MFNominalRange_16_235` |
+| `MF_MT_YUV_MATRIX` | **1 ⇒ BT.709** | 1 = `MFVideoTransferMatrix_BT709`, 2 = `BT601` |
+| `MF_MT_DEFAULT_STRIDE` | 1920 (tight) | row pitch of the Y plane |
+
+The device was set to `1920x1080 @ 60 MJPG`, so MediaFoundation's JPEG decoder
+produced the NV12, and it says so: **full-range BT.709**. Until round 5 the
+conversion hard-coded *studio-swing BT.601* for every format, which on this input:
+
+| source luma | studio-swing BT.601 | full-range BT.709 |
+|---|---|---|
+| 16 | 0 | 16 |
+| 64 | 56 | 64 |
+| 128 | 130 | 128 |
+| 200 | 214 | 200 |
+| 235 | **255 (clipped)** | 235 |
+| 240 | **255 (clipped)** | 240 |
+
+So 21 of 256 luma levels (8% of the tonal range) were being crushed to flat
+white, with mid-tones 7–16% high — a washed-out, too-bright picture with no
+highlight detail. The matrix error is separate and additional: BT.601
+coefficients on BT.709 content shift the hues.
+
+This is also why an uncompressed *native* format needs different maths from a
+decoded one: studio-swing expansion was correct for NV12/YUY2 straight off the
+device and wrong for anything a JPEG/HEVC/H.264 decoder produced. One conversion
+cannot serve both, so the range and matrix are now read per stream and the
+decision is logged and shown. Verified by unit tests over known ramps
+(`video::mf::tests::full_range_luma_is_neither_stretched_nor_clipped`) — the
+device is not always awake, so a test is the only reproducible proof.
+
+**Latency, measured rather than described.** Each frame carries its sampling
+instant; the UI reports `N ms now / N ms worst — N fps` and logs a per-second
+summary. Capture requests `MF_LOW_LATENCY` (never requested before), the UI is
+woken by the capture thread instead of redrawing at the display's refresh rate,
+and chroma is read once per 4:2:0 pair instead of per pixel.

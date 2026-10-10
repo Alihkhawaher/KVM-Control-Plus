@@ -2,9 +2,12 @@
 //! the `nokhwa` crate, and it also decodes MJPG for us.
 //!
 //! The trick that keeps this small: the source reader's output type is set to
-//! **RGB32**, so MediaFoundation inserts its own decoder for compressed camera
-//! formats (MJPG/HEVC/H.264). We never touch a JPEG decoder, and the UI gets a
-//! plain RGB buffer it can upload as a texture.
+//! **NV12**, and MediaFoundation inserts its own decoder for compressed camera
+//! formats (MJPG/HEVC/H.264) — we never touch a JPEG decoder. The NV12 → RGB
+//! conversion is ours ([`ColorInfo`]), deliberately: it keeps the colour maths
+//! visible and unit-testable, and it is the only way to get the *range* right,
+//! because the format the user picks decides whether the samples are
+//! studio-swing (16–235) or full-range (0–255).
 //!
 //! Layout: [`list_devices`] enumerates capture devices (the original's "Video
 //! source" combo box), [`list_formats`] enumerates the native formats so the user
@@ -23,12 +26,13 @@ use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFAttributes, IMFMediaSource, IMFMediaType, IMFSample, IMFSourceReader,
     MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromMediaSource,
     MFEnumDeviceSources, MFMediaType_Video, MFShutdown, MFStartup, MFVideoFormat_MJPG,
-    MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoFormat_YUY2, MFSTARTUP_FULL,
-    MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
+    MFVideoFormat_NV12, MFVideoFormat_RGB32, MFVideoFormat_YUY2, MFVideoTransferMatrix_BT601,
+    MFVideoTransferMatrix_BT709, MFSTARTUP_FULL, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_LOW_LATENCY, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_YUV_MATRIX, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
 };
 
 /// A capture device.
@@ -265,8 +269,12 @@ fn create_reader(source: &IMFMediaSource) -> Result<IMFSourceReader, String> {
         let mut attrs: Option<IMFAttributes> = None;
         MFCreateAttributes(&mut attrs, 2).map_err(|e| format!("MFCreateAttributes: {e}"))?;
         let attrs = attrs.ok_or("attributes null")?;
-        // Let MF insert decoders/scalers so we can always ask for RGB32.
+        // Let MF insert decoders/scalers so we can always ask for NV12.
         let _ = attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1);
+        // Smallest possible delay between a sample being produced and being
+        // handed to us. Without this the source reader buffers ahead, which is
+        // the single biggest contributor to "the picture is a second behind".
+        let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
 
         MFCreateSourceReaderFromMediaSource(source, &attrs)
             .map_err(|e| format!("MFCreateSourceReaderFromMediaSource: {e}"))
@@ -329,6 +337,173 @@ pub fn find_format(formats: &[VideoFormat], wanted: &str) -> Option<VideoFormat>
 }
 
 // ---------------------------------------------------------------------------
+//  Colour: which range and which matrix the arriving YUV is actually in
+// ---------------------------------------------------------------------------
+
+/// Studio-swing (16–235) or full-range (0–255) luma and chroma.
+///
+/// This is not a preference, it is a property of the *format*. MJPG is JPEG,
+/// and JPEG is full-range by definition; the uncompressed formats a UVC device
+/// offers natively (NV12/YUY2) are studio-swing. Getting it wrong is plainly
+/// visible: studio-swing maths applied to full-range data multiplies contrast
+/// by ~1.16 and clips everything from luma 235 up to pure white, which reads
+/// as "the picture is washed out and too bright".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromaRange {
+    Limited,
+    Full,
+}
+
+/// BT.601 or BT.709 colour-difference coefficients. SD content is 601, HD is
+/// normally 709 — but only the media type knows for sure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMatrix {
+    Bt601,
+    Bt709,
+}
+
+impl ColorMatrix {
+    fn name(self) -> &'static str {
+        match self {
+            ColorMatrix::Bt601 => "BT.601",
+            ColorMatrix::Bt709 => "BT.709",
+        }
+    }
+}
+
+impl ChromaRange {
+    fn name(self) -> &'static str {
+        match self {
+            ChromaRange::Limited => "limited 16-235",
+            ChromaRange::Full => "full 0-255",
+        }
+    }
+}
+
+/// How to read the YUV samples that are arriving, and where we learned it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorInfo {
+    pub range: ChromaRange,
+    pub matrix: ColorMatrix,
+    /// Where the decision came from. Carried into the UI because "why does the
+    /// picture look like that" is a question the app is supposed to answer.
+    pub source: &'static str,
+    /// Provenance of the matrix half of the decision.
+    pub matrix_note: Option<&'static str>,
+    /// Row pitch of the Y plane in bytes, as the decoder reports it. Assumed
+    /// tight (`width`) only when the media type does not say.
+    pub y_stride: usize,
+}
+
+// Attribute codes from `MFNominalRange` (mfobjects.h).
+const NOMINAL_RANGE_0_255: u32 = 1;
+const NOMINAL_RANGE_16_235: u32 = 2;
+
+impl ColorInfo {
+    /// Decode the answer from a negotiated media type.
+    ///
+    /// `native_subtype` is the *device-side* format that was asked for, and it
+    /// is the fallback when the type carries no attributes: a decoded format
+    /// (MJPG) yields full-range samples even if nothing says so, because that
+    /// is what a JPEG decoder produces.
+    fn from_media_type(mt: &IMFMediaType, native_subtype: &str, width: u32) -> ColorInfo {
+        let height = unpack_frame_size(unsafe { mt.GetUINT64(&MF_MT_FRAME_SIZE) }.unwrap_or(0)).1;
+
+        // ---- range ----
+        let (range, range_src) = match unsafe { mt.GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE) } {
+            Ok(NOMINAL_RANGE_0_255) => (ChromaRange::Full, "media type says 0-255"),
+            Ok(NOMINAL_RANGE_16_235) => (ChromaRange::Limited, "media type says 16-235"),
+            _ if native_subtype.eq_ignore_ascii_case("MJPG") => {
+                (ChromaRange::Full, "MJPG is JPEG: full-range by definition")
+            }
+            _ => (
+                ChromaRange::Limited,
+                "uncompressed capture: studio swing assumed",
+            ),
+        };
+
+        // ---- matrix ----
+        let (matrix, matrix_src) = match unsafe { mt.GetUINT32(&MF_MT_YUV_MATRIX) } {
+            Ok(v) if v == MFVideoTransferMatrix_BT709.0 as u32 => {
+                (ColorMatrix::Bt709, "media type says BT.709")
+            }
+            Ok(v) if v == MFVideoTransferMatrix_BT601.0 as u32 => {
+                (ColorMatrix::Bt601, "media type says BT.601")
+            }
+            Ok(_) => (ColorMatrix::Bt601, "media type names another matrix"),
+            // No attribute: fall back on the convention, HD is 709.
+            Err(_) if height > 576 => (ColorMatrix::Bt709, "unstated: HD defaults to BT.709"),
+            Err(_) => (ColorMatrix::Bt601, "unstated: SD defaults to BT.601"),
+        };
+
+        // ---- row pitch ----
+        // Signed: a negative stride means a bottom-up buffer.
+        let stride = unsafe { mt.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
+            .ok()
+            .map(|v| (v as i32).unsigned_abs() as usize)
+            .filter(|&s| s >= width as usize)
+            .unwrap_or(width as usize);
+
+        ColorInfo {
+            range,
+            matrix,
+            source: range_src,
+            matrix_note: None,
+            y_stride: stride,
+        }
+        .with_matrix_note(matrix_src)
+    }
+
+    /// Fold the matrix's provenance into the one-line description. The range
+    /// half is the one that decides the brightness, so it is named first.
+    fn with_matrix_note(mut self, note: &'static str) -> ColorInfo {
+        self.matrix_note = Some(note);
+        self
+    }
+
+    pub fn describe(&self) -> String {
+        let matrix = match self.matrix_note {
+            Some(n) => format!("{} ({n})", self.matrix.name()),
+            None => self.matrix.name().to_string(),
+        };
+        format!("{matrix}, {} ({})", self.range.name(), self.source)
+    }
+}
+
+/// One pixel: YUV → RGB, integer fixed point, coefficients chosen by
+/// [`ColorInfo`].
+///
+/// `u`/`v` are chroma already centred on zero (the stored byte minus 128).
+/// Pure and side-effect free on purpose — the device is not always awake, so a
+/// unit test over known ramps is the only way to prove what this does.
+#[inline]
+pub fn yuv_to_rgb(y: u8, u: i32, v: i32, c: &ColorInfo) -> (u8, u8, u8) {
+    // (red-V, green-U, green-V, blue-U), ×256 fixed point.
+    let (cr, cg_u, cg_v, cb) = match (c.range, c.matrix) {
+        (ChromaRange::Limited, ColorMatrix::Bt601) => (409, 100, 208, 516),
+        (ChromaRange::Limited, ColorMatrix::Bt709) => (459, 55, 136, 541),
+        (ChromaRange::Full, ColorMatrix::Bt601) => (359, 88, 183, 454),
+        (ChromaRange::Full, ColorMatrix::Bt709) => (403, 48, 120, 475),
+    };
+    // Studio swing expands 16–235 to 0–255 (298/256 = 1.164); full range
+    // passes luma through untouched (256/256 = 1.0).
+    let base = match c.range {
+        ChromaRange::Limited => 298 * (y as i32 - 16),
+        ChromaRange::Full => 256 * y as i32,
+    };
+    (
+        clamp8((base + cr * v + 128) >> 8),
+        clamp8((base - cg_u * u - cg_v * v + 128) >> 8),
+        clamp8((base + cb * u + 128) >> 8),
+    )
+}
+
+#[inline]
+fn clamp8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+// ---------------------------------------------------------------------------
 //  Capture thread
 // ---------------------------------------------------------------------------
 
@@ -341,6 +516,10 @@ pub struct Frame {
     pub rgb: Vec<u8>,
     /// Whether the source buffer was bottom-up (MediaFoundation RGB32 often is).
     pub flipped: bool,
+    /// When the sample was taken. The age of the newest frame at the moment it
+    /// is drawn *is* the pipeline latency, so it is carried rather than
+    /// estimated — "the picture is behind" deserves a number, not a hunch.
+    pub captured_at: std::time::Instant,
 }
 
 impl Frame {
@@ -386,6 +565,8 @@ pub enum CaptureMsg {
         width: u32,
         height: u32,
         label: String,
+        /// How the arriving samples are being read, for the UI to show.
+        colour: String,
     },
     Frame(Frame),
     /// Non-fatal problem (e.g. a dropped sample).
@@ -402,11 +583,16 @@ pub struct CaptureThread {
 
 impl CaptureThread {
     /// Start streaming `symbolic_link`, preferring `format_label` (empty = auto).
+    ///
+    /// `wake` is called after every message is queued. The UI must redraw when a
+    /// frame lands, and the alternative — redrawing as fast as the display
+    /// allows, hoping to notice one — burns a core and adds jitter.
     pub fn start(
         symbolic_link: String,
         format_label: String,
         flip_vertical: bool,
         tx: Sender<CaptureMsg>,
+        wake: Box<dyn Fn() + Send>,
     ) -> Result<CaptureThread, String> {
         ensure_started()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -421,8 +607,10 @@ impl CaptureThread {
                     flip_vertical,
                     &tx,
                     &stop_thread,
+                    &wake,
                 ) {
                     let _ = tx.send(CaptureMsg::Stopped(e));
+                    wake();
                 }
                 stop_thread.store(true, Ordering::Relaxed);
             })
@@ -456,6 +644,7 @@ fn capture_loop(
     flip_vertical: bool,
     tx: &Sender<CaptureMsg>,
     stop: &AtomicBool,
+    wake: &(dyn Fn() + Send),
 ) -> Result<(), String> {
     let source = open_source(symbolic_link)?;
     let reader = create_reader(&source)?;
@@ -463,11 +652,12 @@ fn capture_loop(
     // Choose the format: the requested one, or MF's own best default.
     // The frame size lives on the *media type*, not on the samples, so it is
     // captured here and handed to every conversion.
-    let (width, height, label) = configure_reader(&reader, symbolic_link, format_label)?;
+    let (width, height, label, color) = configure_reader(&reader, symbolic_link, format_label)?;
     let _ = tx.send(CaptureMsg::Started {
         width,
         height,
         label,
+        colour: color.describe(),
     });
 
     let mut cb = CaptureBuffers::new();
@@ -503,14 +693,30 @@ fn capture_loop(
         }
         let Some(sample) = sample else { continue };
 
-        match convert_sample(&sample, &mut cb, flip_vertical, width, height) {
+        // Stamped as early as possible: everything after this is our latency,
+        // and understating it would defeat the measurement.
+        let captured_at = std::time::Instant::now();
+
+        match convert_sample(
+            &sample,
+            &mut cb,
+            flip_vertical,
+            width,
+            height,
+            &color,
+            captured_at,
+        ) {
             Ok(frame) => {
                 if tx.send(CaptureMsg::Frame(frame)).is_err() {
                     return Ok(()); // UI closed
                 }
+                // Wake the UI *because* a frame arrived, instead of letting it
+                // spin at the display's refresh rate waiting to notice one.
+                wake();
             }
             Err(e) => {
                 let _ = tx.send(CaptureMsg::Warning(e));
+                wake();
             }
         }
     }
@@ -518,7 +724,8 @@ fn capture_loop(
 
 /// Set the reader's output type to NV12 at the requested (or best) size.
 ///
-/// Returns the chosen `(width, height, label)`.
+/// Returns the chosen `(width, height, label)` plus the [`ColorInfo`] describing
+/// how the arriving samples must be read.
 ///
 /// Why NV12 rather than RGB32: NV12 is the uncompressed layout this class of
 /// UVC dongle produces natively, so taking it directly keeps one transform out
@@ -532,7 +739,7 @@ fn configure_reader(
     reader: &IMFSourceReader,
     symbolic_link: &str,
     format_label: &str,
-) -> Result<(u32, u32, String), String> {
+) -> Result<(u32, u32, String, ColorInfo), String> {
     // Which native format should the output match?
     let native = if format_label.is_empty() {
         None
@@ -552,25 +759,49 @@ fn configure_reader(
             let _ = out.SetUINT64(&MF_MT_FRAME_SIZE, size);
             let rate = ((f.fps_numerator as u64) << 32) | f.fps_denominator.max(1) as u64;
             let _ = out.SetUINT64(&MF_MT_FRAME_RATE, rate);
-            // RGB32 from MF is commonly bottom-up; record the stride so the
-            // converter can flip when needed.
-            let _ = out.SetUINT32(&MF_MT_DEFAULT_STRIDE, f.width * 4);
+            // NV12's row pitch is the luma width, not width×4 — the old
+            // width×4 value was an RGB32 leftover and describes a buffer three
+            // times wider than the one we get.
+            let _ = out.SetUINT32(&MF_MT_DEFAULT_STRIDE, f.width);
         }
 
         reader
             .SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, None, &out)
-            .map_err(|e| format!("cannot set RGB32 output (device busy?): {e}"))?;
+            .map_err(|e| format!("cannot set NV12 output (device busy?): {e}"))?;
 
         // Ask MF what it actually settled on.
         let actual = reader
             .GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32)
             .map_err(|e| format!("GetCurrentMediaType: {e}"))?;
         let f = media_type_to_format(&actual);
-        let (w, h, label) = match f.or(native) {
+        let (w, h, label) = match &f {
             Some(f) => (f.width, f.height, f.label()),
-            None => (0, 0, "unknown".to_string()),
+            None => match &native {
+                Some(f) => (f.width, f.height, f.label()),
+                None => (0, 0, "unknown".to_string()),
+            },
         };
-        Ok((w, h, label))
+
+        // Which device-side format are we decoding? It decides the fallback
+        // when the media type carries no range attribute.
+        let native_subtype = native
+            .as_ref()
+            .map(|f| f.subtype.clone())
+            .or_else(|| f.as_ref().map(|f| f.subtype.clone()))
+            .unwrap_or_default();
+        let color = ColorInfo::from_media_type(&actual, &native_subtype, w);
+
+        // Permanent: this line answers "why does the picture look like that",
+        // and it is the first thing to check when it looks wrong.
+        crate::logging::info(format!(
+            "colour: {} | output type {}x{} stride {}",
+            color.describe(),
+            w,
+            h,
+            color.y_stride
+        ));
+
+        Ok((w, h, label, color))
     }
 }
 
@@ -585,13 +816,20 @@ impl CaptureBuffers {
     }
 }
 
-/// Lock the sample's buffer and convert BGRA/RGB32 → packed RGB8.
+/// Lock the sample's buffer and convert NV12 → packed RGB8.
+///
+/// The range and matrix come from `color`, which was read off the media type
+/// the decoder actually produced rather than assumed — that is the difference
+/// between a correct picture and one whose contrast is stretched and whose
+/// highlights are clipped flat.
 fn convert_sample(
     sample: &IMFSample,
     cb: &mut CaptureBuffers,
     flip_vertical: bool,
     width: u32,
     height: u32,
+    color: &ColorInfo,
+    captured_at: std::time::Instant,
 ) -> Result<Frame, String> {
     unsafe {
         let buffer = sample
@@ -609,6 +847,9 @@ fn convert_sample(
         // much the buffer can hold. A zero `current` — or a buffer that is all
         // zeros — explains a black picture far faster than staring at a window.
         let current = buffer.GetCurrentLength().unwrap_or(0);
+        // NV12 rows are `pitch` bytes apart, and the UV plane's rows match.
+        let pitch = color.y_stride.max(width as usize);
+        let luma_bytes = pitch * height as usize;
         {
             let probe = std::slice::from_raw_parts(ptr, max_len as usize);
             let brightest = probe.iter().copied().max().unwrap_or(0);
@@ -620,7 +861,7 @@ fn convert_sample(
             };
             // NV12 split, so a uniformly dark *picture* is distinguishable from
             // a stream that carries no picture at all.
-            let y_part = (width as usize * height as usize).min(probe.len());
+            let y_part = luma_bytes.min(probe.len());
             let (y_slice, uv_slice) = probe.split_at(y_part);
             let y_min = y_slice.iter().copied().min().unwrap_or(0);
             let y_max = y_slice.iter().copied().max().unwrap_or(0);
@@ -635,8 +876,8 @@ fn convert_sample(
                 uv_slice.iter().map(|&b| b as u64).sum::<u64>() as f64 / uv_slice.len() as f64
             };
             crate::logging::trace(format!(
-                "frame {}x{} buffer current={current} max={max_len} brightest={brightest} mean={mean:.2} | Y min={y_min} max={y_max} mean={y_mean:.2} | UV mean={uv_mean:.2}",
-                width, height
+                "frame {width}x{height} buffer current={current} max={max_len} brightest={brightest} mean={mean:.2} | Y min={y_min} max={y_max} mean={y_mean:.2} | U/V mean={uv_mean:.2} | {}",
+                color.describe()
             ));
         }
 
@@ -654,49 +895,48 @@ fn convert_sample(
             // so no transform MFT is required and the colour maths stays here
             // where it can be traced and tested.
             let src = std::slice::from_raw_parts(ptr, max_len as usize);
-            let y_plane = w as usize * h as usize;
-            if src.len() < y_plane + y_plane / 2 {
+            let uv_rows = h as usize / 2;
+            let uv_bytes = pitch * uv_rows;
+            if src.len() < luma_bytes + uv_bytes {
                 return Err(format!(
-                    "NV12 buffer too small: {} bytes for {}x{}",
+                    "NV12 buffer too small: {} bytes for {w}x{h} (needs {} at stride {pitch})",
                     src.len(),
-                    w,
-                    h
+                    luma_bytes + uv_bytes
                 ));
             }
-            let uv_plane = &src[y_plane..];
-            let uv_stride = w as usize; // 2 bytes per 2x2 chroma block
+            let uv_plane = &src[luma_bytes..];
 
             for y in 0..h as usize {
                 let src_y = if flip_vertical { h as usize - 1 - y } else { y };
                 let dst_row = y * packed;
-                let lum_row = src_y * w as usize;
-                let chroma_row = (src_y / 2) * uv_stride;
-                for x in 0..w as usize {
-                    let luma = src[lum_row + x] as i32;
+                let lum_row = src_y * pitch;
+                let chroma_row = (src_y / 2) * pitch;
+                // 4:2:0 — two horizontal pixels share one chroma pair, so it is
+                // read once per pair instead of recomputed for every pixel.
+                let mut x = 0usize;
+                while x < w as usize {
                     let cidx = chroma_row + (x / 2) * 2;
                     let u = uv_plane[cidx] as i32 - 128;
                     let v = uv_plane[cidx + 1] as i32 - 128;
 
-                    // BT.601 limited range, integer fixed point.
-                    let c = 298 * (luma - 16);
-                    let r = (c + 409 * v + 128) >> 8;
-                    let g = (c - 100 * u - 208 * v + 128) >> 8;
-                    let b = (c + 516 * u + 128) >> 8;
+                    let mut dx = 0usize;
+                    while dx < 2 && x + dx < w as usize {
+                        let (r, g, b) = yuv_to_rgb(src[lum_row + x + dx], u, v, color);
+                        let d = dst_row + (x + dx) * 3;
+                        cb.rgb[d] = r;
+                        cb.rgb[d + 1] = g;
+                        cb.rgb[d + 2] = b;
 
-                    let d = dst_row + x * 3;
-                    cb.rgb[d] = r.clamp(0, 255) as u8;
-                    cb.rgb[d + 1] = g.clamp(0, 255) as u8;
-                    cb.rgb[d + 2] = b.clamp(0, 255) as u8;
-
-                    if y == 0 && x == 0 {
-                        crate::logging::trace(format!(
-                            "px0 luma_idx={} luma={luma} cidx={cidx} u={u} v={v} -> r={r} g={g} b={b}; src.len={} src[0..12]={:?} uv[0..12]={:?}",
-                            lum_row + x,
-                            src.len(),
-                            &src[..12.min(src.len())],
-                            &uv_plane[..12.min(uv_plane.len())]
-                        ));
+                        if y == 0 && x + dx == 0 {
+                            crate::logging::trace(format!(
+                                "px0 luma_idx={} u={u} v={v} -> r={r} g={g} b={b} | {}",
+                                lum_row,
+                                color.describe()
+                            ));
+                        }
+                        dx += 1;
                     }
+                    x += 2;
                 }
             }
             // ---- permanent diagnostics: prove what we produced, not just read ----
@@ -718,6 +958,7 @@ fn convert_sample(
                 height: h,
                 rgb: std::mem::take(&mut cb.rgb),
                 flipped: flip_vertical,
+                captured_at,
             })
         })();
 
@@ -956,5 +1197,97 @@ mod tests {
             }
             Err(e) => panic!("device enumeration failed: {e}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    //  Colour maths. The device is not always awake, so a known ramp through a
+    //  pure function is the only way to prove what the conversion does — and
+    //  this is the maths that decided whether the picture looked right.
+    // -----------------------------------------------------------------------
+
+    fn color(range: ChromaRange, matrix: ColorMatrix) -> ColorInfo {
+        ColorInfo {
+            range,
+            matrix,
+            source: "test",
+            matrix_note: None,
+            y_stride: 0,
+        }
+    }
+
+    const ALL: [(ChromaRange, ColorMatrix); 4] = [
+        (ChromaRange::Limited, ColorMatrix::Bt601),
+        (ChromaRange::Limited, ColorMatrix::Bt709),
+        (ChromaRange::Full, ColorMatrix::Bt601),
+        (ChromaRange::Full, ColorMatrix::Bt709),
+    ];
+
+    /// The shipped bug: studio-swing maths applied to full-range (MJPG) data.
+    /// Luma 235 is 235 in a 0-255 source, but expanding it as if it were 16-235
+    /// pushes it to 278 and clips it to flat white, stretching everything below
+    /// by ~16%. That is the "washed out, too bright" picture.
+    #[test]
+    fn full_range_luma_is_neither_stretched_nor_clipped() {
+        let full = color(ChromaRange::Full, ColorMatrix::Bt601);
+        assert_eq!(yuv_to_rgb(0, 0, 0, &full).0, 0);
+        assert_eq!(yuv_to_rgb(255, 0, 0, &full).0, 255);
+        assert_eq!(yuv_to_rgb(235, 0, 0, &full).0, 235, "235 must stay 235");
+        assert_eq!(yuv_to_rgb(128, 0, 0, &full).0, 128);
+
+        let studio = color(ChromaRange::Limited, ColorMatrix::Bt601);
+        assert_eq!(
+            yuv_to_rgb(235, 0, 0, &studio).0,
+            255,
+            "and the old maths does clip it — this is the bug being fixed"
+        );
+    }
+
+    /// Studio-swing input must still expand to the full 0-255 output: that half
+    /// of the old behaviour was right and must stay right.
+    #[test]
+    fn studio_swing_luma_still_expands() {
+        let studio = color(ChromaRange::Limited, ColorMatrix::Bt601);
+        assert_eq!(yuv_to_rgb(16, 0, 0, &studio).0, 0);
+        assert_eq!(yuv_to_rgb(235, 0, 0, &studio).0, 255);
+        let mid = yuv_to_rgb(126, 0, 0, &studio).0;
+        assert!((126..=131).contains(&mid), "mid grey ~128, got {mid}");
+    }
+
+    /// Every combination must agree on the things that define a colour space:
+    /// grey stays grey, +V is red, +U is blue.
+    #[test]
+    fn chroma_leans_the_right_way_in_every_variant() {
+        for (range, matrix) in ALL {
+            let c = color(range, matrix);
+            // A value in the middle of each range.
+            let luma = match range {
+                ChromaRange::Limited => 126,
+                ChromaRange::Full => 128,
+            };
+
+            let (r, g, b) = yuv_to_rgb(luma, 0, 0, &c);
+            assert!(
+                r.abs_diff(g) <= 2 && g.abs_diff(b) <= 2,
+                "{range:?}/{matrix:?}: zero chroma must stay grey, got {r},{g},{b}"
+            );
+
+            let (r_up, _, _) = yuv_to_rgb(luma, 0, 40, &c);
+            let (r_dn, _, _) = yuv_to_rgb(luma, 0, -40, &c);
+            assert!(r_up > r_dn, "{range:?}/{matrix:?}: +V must raise red");
+
+            let (_, _, b_up) = yuv_to_rgb(luma, 40, 0, &c);
+            assert!(b_up > b, "{range:?}/{matrix:?}: +U must raise blue");
+        }
+    }
+
+    /// The attributes decide; the fallbacks only apply when the media type is
+    /// silent. These are the codes from `mfobjects.h` — 1 is full, 2 is limited,
+    /// and swapping them would be worse than having no fallback at all.
+    #[test]
+    fn nominal_range_codes_match_the_windows_header() {
+        assert_eq!(NOMINAL_RANGE_0_255, 1);
+        assert_eq!(NOMINAL_RANGE_16_235, 2);
+        assert_eq!(MFVideoTransferMatrix_BT709.0, 1);
+        assert_eq!(MFVideoTransferMatrix_BT601.0, 2);
     }
 }

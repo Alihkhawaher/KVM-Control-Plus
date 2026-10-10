@@ -59,6 +59,10 @@ struct Toast {
 pub struct KvmControlPlusApp {
     settings: Settings,
     palette: Palette,
+    /// A handle on the egui context so the capture thread can wake the UI when a
+    /// frame lands, instead of the UI redrawing at the display's refresh rate
+    /// hoping to notice one.
+    ctx: egui::Context,
 
     // ---- discovered devices ----
     devices: Vec<VideoDevice>,
@@ -77,6 +81,10 @@ pub struct KvmControlPlusApp {
     last_frame: Option<crate::video::Frame>,
     video_label: String,
     video_error: Option<String>,
+    /// How the arriving samples are being interpreted (range + matrix), as
+    /// reported by the capture thread. Shown so a wrong-looking picture can be
+    /// diagnosed from the window instead of from the source.
+    video_colour: String,
     /// Real measured USB link for the selected capture device, if we could get
     /// one. `None` + a note means "could not measure", never "assumed fine".
     usb_link: Option<crate::video::usb_link::UsbLink>,
@@ -86,6 +94,13 @@ pub struct KvmControlPlusApp {
     frames_this_second: u32,
     fps: f32,
     fps_mark: std::time::Instant,
+    /// Age of the newest frame when it was drawn, in milliseconds. This is the
+    /// pipeline latency — measured, because "the picture is behind" is a claim
+    /// that needs a number.
+    latency_ms: f32,
+    latency_sum_ms: f32,
+    latency_max_ms: f32,
+    latency_samples: u32,
 
     // ---- ui state ----
     tab: Tab,
@@ -145,11 +160,16 @@ impl KvmControlPlusApp {
             last_frame: None,
             video_label: String::new(),
             video_error: None,
+            video_colour: String::new(),
             usb_link: None,
             usb_link_note: None,
             frames_this_second: 0,
             fps: 0.0,
             fps_mark: std::time::Instant::now(),
+            latency_ms: 0.0,
+            latency_sum_ms: 0.0,
+            latency_max_ms: 0.0,
+            latency_samples: 0,
             tab: Tab::Devices,
             capturing: false,
             fullscreen_video: false,
@@ -165,6 +185,7 @@ impl KvmControlPlusApp {
             input_rx,
             settings,
             palette,
+            ctx: cc.egui_ctx.clone(),
         };
 
         app.restore_selections();
@@ -343,6 +364,31 @@ impl KvmControlPlusApp {
             &p,
             "LINK & FORMATS — WHY THE PICTURE LOOKS LIKE IT DOES",
         );
+
+        // ---- 0. what the picture is doing right now ----
+        // The colour interpretation is the single fact that decides whether the
+        // picture looks right, and the latency is the only honest answer to "is
+        // it behind" — both belong in the window, not in a debug session.
+        if !self.video_colour.is_empty() {
+            ui::kv(ui, &p, "Colour", &self.video_colour, None);
+        }
+        if self.capture.is_some() {
+            let latency_color = if self.latency_ms > 120.0 {
+                p.warn
+            } else {
+                p.ok
+            };
+            ui::kv(
+                ui,
+                &p,
+                "Latency",
+                &format!(
+                    "{:.0} ms now, {:.0} ms worst — {:.0} fps",
+                    self.latency_ms, self.latency_max_ms, self.fps
+                ),
+                Some(latency_color),
+            );
+        }
 
         // ---- 1. which device, on which link ----
         let mut device_vid_pid: Option<(u16, u16)> = None;
@@ -626,11 +672,17 @@ impl KvmControlPlusApp {
             .unwrap_or_default();
 
         let (tx, rx) = channel();
+        // The capture thread wakes the UI when a frame arrives. Without this the
+        // only way to notice a frame was to redraw continuously — which is what
+        // the old unconditional `request_repaint` did, at the display's rate,
+        // forever, whether or not anything had changed.
+        let wake_ctx = self.ctx.clone();
         match CaptureThread::start(
             d.symbolic_link.clone(),
             label.clone(),
             self.settings.flip_vertical,
             tx,
+            Box::new(move || wake_ctx.request_repaint()),
         ) {
             Ok(c) => {
                 log::info(format!("video started: {} [{}]", d.name, label));
@@ -770,9 +822,14 @@ impl KvmControlPlusApp {
                     width,
                     height,
                     label,
+                    colour,
                 } => {
                     self.video_label = format!("{width}x{height} {label}");
-                    log::info(format!("stream live at {}", self.video_label));
+                    self.video_colour = colour;
+                    log::info(format!(
+                        "stream live at {} — colour: {}",
+                        self.video_label, self.video_colour
+                    ));
                 }
                 CaptureMsg::Warning(w) => log::warn(w),
                 CaptureMsg::Stopped(reason) => {
@@ -788,6 +845,15 @@ impl KvmControlPlusApp {
         }
 
         if let Some(frame) = newest {
+            // How long the newest frame had been waiting before it was drawn.
+            // That age *is* the pipeline latency, and measuring it is the only
+            // way to tell whether a change to the capture path actually helped.
+            let age_ms = frame.captured_at.elapsed().as_secs_f32() * 1000.0;
+            self.latency_ms = age_ms;
+            self.latency_sum_ms += age_ms;
+            self.latency_max_ms = self.latency_max_ms.max(age_ms);
+            self.latency_samples += 1;
+
             let image = egui::ColorImage::from_rgb(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgb,
@@ -804,15 +870,31 @@ impl KvmControlPlusApp {
         }
 
         if self.fps_mark.elapsed().as_millis() >= 1000 {
-            self.fps = self.frames_this_second as f32 * 1000.0
-                / self.fps_mark.elapsed().as_millis() as f32;
+            let elapsed_ms = self.fps_mark.elapsed().as_millis() as f32;
+            self.fps = self.frames_this_second as f32 * 1000.0 / elapsed_ms;
             self.frames_this_second = 0;
             self.fps_mark = std::time::Instant::now();
+
+            // Permanent: the latency number belongs to the user, not in a debug
+            // session — it is the answer to "is the picture behind".
+            if self.latency_samples > 0 {
+                log::info(format!(
+                    "pipeline: {:.1} fps, latency {:.0} ms average / {:.0} ms worst ({} frames)",
+                    self.fps,
+                    self.latency_sum_ms / self.latency_samples as f32,
+                    self.latency_max_ms,
+                    self.latency_samples
+                ));
+            }
+            self.latency_sum_ms = 0.0;
+            self.latency_max_ms = 0.0;
+            self.latency_samples = 0;
         }
 
-        if self.capture.is_some() {
-            ctx.request_repaint();
-        }
+        // No unconditional `request_repaint` here on purpose: the capture thread
+        // wakes the UI when a frame arrives (see `start_video`). Redrawing at
+        // the display's refresh rate just to notice frames burns a core and
+        // turns frame timing into jitter.
     }
 
     fn pump_input_events(&mut self) {
@@ -1569,6 +1651,9 @@ impl KvmControlPlusApp {
         if !self.video_label.is_empty() {
             parts.push(self.video_label.clone());
         }
+        if !self.video_colour.is_empty() {
+            parts.push(self.video_colour.clone());
+        }
         if parts.is_empty() {
             "idle".to_string()
         } else {
@@ -1644,7 +1729,10 @@ impl KvmControlPlusApp {
                         ui.painter().text(
                             img.left_top() + egui::vec2(8.0, 8.0),
                             egui::Align2::LEFT_TOP,
-                            format!("{}  {:.0} fps", self.video_label, self.fps),
+                            format!(
+                                "{}  {:.0} fps  {:.0} ms",
+                                self.video_label, self.fps, self.latency_ms
+                            ),
                             egui::FontId::monospace(11.0),
                             Color32::from_rgb(200, 210, 220),
                         );

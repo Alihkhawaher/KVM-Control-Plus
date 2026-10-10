@@ -66,6 +66,11 @@ KVM-Control Plus/
        ├─ mf.rs      MediaFoundation: device enumeration, native-format listing,
        │             source reader, NV12→RGB conversion, and the diagnostics
        │             (per-frame byte stats, --raw-probe, --grab-native).
+       │             `ColorInfo` decides whether the picture looks right: it
+       │             reads the *range* (0-255 vs 16-235) and *matrix*
+       │             (BT.601/BT.709) off the negotiated media type rather than
+       │             assuming, and `yuv_to_rgb` is a pure function so the colour
+       │             maths can be tested without a live source.
        └─ usb_link.rs  Real USB link-speed measurement from the hub, plus the
                       arithmetic that decides whether a format can fit.
 ```

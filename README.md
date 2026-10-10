@@ -26,6 +26,32 @@ bar ("Show pane" now) and the choice is remembered between runs.*
 *The light theme. The log panel is the app's own ring buffer, not a console.*
 
 
+## The picture, in the right colour
+
+The app does its own NV12 → RGB conversion, and what decides whether the result
+looks right is knowing what **range** and **matrix** the incoming samples are in.
+Both are read off the media type the decoder actually produced, rather than
+assumed:
+
+| attribute | value | meaning |
+|---|---|---|
+| `MF_MT_VIDEO_NOMINAL_RANGE` | 1 / 2 | full 0–255 / studio swing 16–235 |
+| `MF_MT_YUV_MATRIX` | 1 / 2 | BT.709 / BT.601 |
+
+That matters because **the format you pick changes the answer**: MJPG is JPEG,
+and JPEG is full-range, while the uncompressed formats a UVC dongle offers
+natively are studio-swing. Reading full-range data as studio-swing stretches
+contrast by ~16% and clips every luma level from 235 upward to flat white — 8% of
+the tonal range, and a picture that looks washed out and too bright. The decision
+and its reason appear in the log and in the **LINK & FORMATS** panel.
+
+**Latency is measured, not guessed.** Every frame carries the instant it was
+sampled, and the window shows `N ms now / N ms worst — N fps` (also overlaid on
+the video and logged once a second). Capture requests `MF_LOW_LATENCY`, the UI
+redraws when a frame arrives instead of at the display's refresh rate, and chroma
+is read once per 4:2:0 pair rather than per pixel.
+
+
 ## Why it is lean, on purpose
 
 ```toml

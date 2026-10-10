@@ -335,6 +335,8 @@ fn main() -> eframe::Result<()> {
             String::new(),
             false,
             tx,
+            // No UI to wake: this mode polls the channel itself.
+            Box::new(|| {}),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -375,8 +377,9 @@ fn main() -> eframe::Result<()> {
                     width,
                     height,
                     label,
+                    colour,
                 }) => {
-                    println!("  stream live at {width}x{height} {label}");
+                    println!("  stream live at {width}x{height} {label} — colour: {colour}");
                 }
                 Ok(video::CaptureMsg::Warning(w)) => eprintln!("  warn: {w}"),
                 Ok(video::CaptureMsg::Stopped(e)) => {

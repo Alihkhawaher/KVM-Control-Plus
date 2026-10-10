@@ -4,7 +4,7 @@ Living document. Updated as work lands. `[x]` = done and verified on real
 hardware, `[~]` = coded but not yet exercised against a live source, `[ ]` = not
 started.
 
-Last updated: round 4 (console handling, pane toggle, screenshots, public release).
+Last updated: round 5 (correct colour range/matrix, low-latency capture, measured pipeline latency).
 
 ---
 
@@ -64,6 +64,28 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
 - [x] **Single-file artifact** — `+crt-static` in `.cargo/config.toml`. Verified
       from the PE import table: 23 imports, all Windows system DLLs, no
       `VCRUNTIME140.dll` and no `api-ms-win-crt-*` shims. Costs ~170 KB.
+- [x] **Correct colour range and matrix (the "too bright" picture).** The NV12→RGB
+      conversion hard-coded *studio-swing BT.601* for every format. MediaFoundation
+      reports otherwise: an MJPG stream decodes to **full-range 0–255 BT.709**, so
+      the maths was stretching contrast by ~16% and clipping every luma level from
+      235 up to flat white — 8% of the tonal range gone, mid-tones 7–16% high.
+      Range and matrix are now read from the negotiated media type
+      (`MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_YUV_MATRIX`), fall back per format
+      (MJPG ⇒ full range because JPEG is), and are logged and shown in the window.
+      The maths is a pure function with unit tests over known ramps.
+- [x] **Low-latency capture.** `MF_LOW_LATENCY` is now set on the source reader
+      (it was never requested, so MF buffered ahead), and the UI no longer redraws
+      at the display's refresh rate hoping to notice a frame — the capture thread
+      wakes it when one arrives. The per-pixel loop also reads chroma once per
+      4:2:0 pair instead of recomputing it per pixel.
+- [x] **Measured pipeline latency.** Every frame carries the instant it was
+      sampled; the UI reports `N ms now / N ms worst / N fps` in the overlay and
+      the report panel and logs a per-second summary. "The picture is behind" now
+      has a number, and a change to the capture path can be judged against it.
+- [x] **Luma stride honoured.** The reader used to be told the row pitch was
+      `width × 4` (an RGB32 leftover) while an NV12 buffer was being read; the
+      conversion ignored the reported stride entirely. Both now use the pitch the
+      media type reports.
 - [x] **CLI verification modes** — `--version`, `--list-ports`, `--list-devices`,
       `--list-formats N`, `--probe`, `--usb`, `--snapshot`, `--raw-probe`,
       `--grab-native`. These are how the capture problem was diagnosed.

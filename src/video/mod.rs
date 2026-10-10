@@ -80,6 +80,7 @@ mod tests {
             height: 2,
             rgb: vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
             flipped: false,
+            captured_at: std::time::Instant::now(),
         };
         let dir = std::env::temp_dir().join("kvm-control-plus-tests");
         std::fs::create_dir_all(&dir).unwrap();
@@ -105,6 +106,7 @@ mod tests {
             height: 0,
             rgb: vec![],
             flipped: false,
+            captured_at: std::time::Instant::now(),
         };
         let err = write_bmp(Path::new("x.bmp"), &frame).unwrap_err();
         assert!(err.contains("empty"));
