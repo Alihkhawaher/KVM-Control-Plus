@@ -8,8 +8,6 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use eframe::egui;
-
 /// Severity, ordered so `Trace < Debug < Info < Warn < Error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -42,16 +40,6 @@ impl Level {
             Level::Error => "ERROR",
         }
     }
-
-    pub fn color(self) -> egui::Color32 {
-        match self {
-            Level::Trace => egui::Color32::from_rgb(120, 130, 145),
-            Level::Debug => egui::Color32::from_rgb(130, 170, 200),
-            Level::Info => egui::Color32::from_rgb(200, 205, 215),
-            Level::Warn => egui::Color32::from_rgb(230, 190, 110),
-            Level::Error => egui::Color32::from_rgb(235, 120, 110),
-        }
-    }
 }
 
 /// One recorded log line.
@@ -71,6 +59,10 @@ struct LogState {
 }
 
 const RING_CAPACITY: usize = 4000;
+
+/// Whether the logger still has a console to write to. Flipped off by
+/// [`detach_stdout`] when the app gives its console back to Windows.
+static STDOUT_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 static LOG: OnceLock<Mutex<LogState>> = OnceLock::new();
 
@@ -92,11 +84,29 @@ pub fn init(stdout_level: Level, panel_level: Level) {
     s.panel_level = panel_level;
 }
 
+/// Stop writing to stdout/stderr, because the console has been detached and the
+/// stream no longer exists.
+///
+/// Logging itself is *not* turned off — this is the opposite of removing it. The
+/// ring buffer keeps receiving every line exactly as before, so the GUI log panel
+/// is unaffected; only a console nobody can see anymore stops being written to.
+/// (`eprintln!` panics when the write fails, so this must be called before
+/// `FreeConsole`.)
+pub fn detach_stdout() {
+    STDOUT_ATTACHED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the logger is still writing to a console. Exposed so `main` can tell
+/// the user where the log went.
+pub fn stdout_attached() -> bool {
+    STDOUT_ATTACHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record a line at `level`.
 pub fn log(level: Level, message: impl Into<String>) {
     let message = message.into();
     let mut s = state().lock().unwrap();
-    if level >= s.stdout_level {
+    if level >= s.stdout_level && stdout_attached() {
         eprintln!("[{}] {message}", level.tag());
     }
     if s.lines.len() == RING_CAPACITY {

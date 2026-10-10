@@ -90,6 +90,14 @@ pub fn apply(ctx: &egui::Context, p: &Palette) {
     style.spacing.item_spacing = egui::vec2(8.0, 7.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
     style.spacing.interact_size.y = 22.0;
+
+    // Solid (non-floating) scroll bars. egui's stock style floats the bar over the
+    // content and fades the handle to *zero* opacity while it is idle, so a pane
+    // whose content continues below the fold looks like it was simply cut off
+    // rather than scrollable. The controls pane is exactly that case — its content
+    // is around twice the height of a normal window — so the bar must always show.
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
+
     ctx.set_style_of(theme, style);
 }
 

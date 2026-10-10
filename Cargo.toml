@@ -1,6 +1,6 @@
 [package]
 name = "kvm-control-plus"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 description = "Laptop-as-KVM: view a remote machine's video capture and drive its keyboard/mouse over a CH9329 serial cable."
@@ -62,6 +62,7 @@ features = [
     # ---- gates that the above APIs really live behind ----
     "Win32_Security",              # CreateFileW takes SECURITY_ATTRIBUTES
     "Win32_System_IO",             # ReadFile / WriteFile
+    "Win32_System_Console",        # GetConsoleProcessList / FreeConsole (GUI drops its console)
     "Win32_Graphics_Gdi",          # WNDCLASSW / RegisterClassW live behind GDI
     "Win32_System_SystemServices", # MAXDWORD
 ]

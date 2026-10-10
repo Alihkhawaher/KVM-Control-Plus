@@ -22,18 +22,26 @@ KVM-Control Plus/
 └─ src/
    ├─ main.rs        CLI entry: flag parsing, the headless modes, then hands off
    │                 to the GUI. Every diagnostic the project owns is reachable
-   │                 from here.
+   │                 from here. In GUI mode it calls `detach_own_console()` — the
+   │                 binary is a console app so the modes work in a terminal, and a
+   │                 double-click therefore gets a console nobody asked for; it is
+   │                 given back, but only when this process solely owns it.
    ├─ app.rs         The application: state machine, tabs, panels, and the
    │                 "link & formats" report. Largest file by design — one place
-   │                 to see what the UI does.
+   │                 to see what the UI does. Holds the pane toggle
+   │                 (`show_left_pane`) and `level_color`, which resolves log
+   │                 colours against the active palette (colour is presentation,
+   │                 so it does not live in `logging`).
    ├─ config.rs      Settings: hand-rolled `key = value`, no serde. Load is
    │                 once-logged (startup reads it twice).
    ├─ logging.rs     Ring-buffer logger + Level. Feeds both stdout and the GUI
    │                 log panel. Levels: trace < debug < info < warn < error.
    ├─ ui/
-   │   ├─ mod.rs     Palette/theme and the small widget kit (section, kv,
-   │   │             badge, pill, chip). `kv` truncates over-long values so a
-   │   │             row can never overlap.
+   │   ├─ mod.rs     Palette/theme (dark + light) and the small widget kit
+   │   │             (section, kv, badge, pill, chip). `kv` truncates over-long
+   │   │             values so a row can never overlap. Also installs
+   │   │             `ScrollStyle::solid()`: the stock floating bar is drawn at
+   │   │             zero opacity while idle, which makes a long pane look cut off.
    ├─ input/
    │   ├─ mod.rs     Re-exports.
    │   ├─ hook.rs    Dedicated input thread: own hidden window + message pump,

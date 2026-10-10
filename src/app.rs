@@ -96,6 +96,11 @@ pub struct KvmControlPlusApp {
     log_level: Level,
     log_autoscroll: bool,
     show_log: bool,
+    /// Hide the left controls pane for a video-only window (top-bar toggle).
+    show_left_pane: bool,
+    /// Last left-pane geometry we logged, so the diagnostic fires on change
+    /// instead of once per frame (and does not drown the panel it describes).
+    pane_geom_logged: Option<(i32, i32, i32, i32)>,
     /// When the app came up, so every log line can carry an offset instead of a
     /// wall-clock timestamp nobody can line up with anything.
     log_start: std::time::Instant,
@@ -153,6 +158,8 @@ impl KvmControlPlusApp {
             log_level: parse_level(&settings.log_level),
             log_autoscroll: true,
             show_log: true,
+            show_left_pane: settings.show_left_pane,
+            pane_geom_logged: None,
             log_start: std::time::Instant::now(),
             input_tx,
             input_rx,
@@ -898,6 +905,20 @@ impl KvmControlPlusApp {
                 {
                     self.show_log = !self.show_log;
                 }
+                // The pane holds every control, so it must always be reachable:
+                // this button stays in the top bar whether the pane is up or not.
+                if ui
+                    .button(if self.show_left_pane {
+                        "Hide pane"
+                    } else {
+                        "Show pane"
+                    })
+                    .on_hover_text("Hide the left pane for a video-only view")
+                    .clicked()
+                {
+                    self.show_left_pane = !self.show_left_pane;
+                    self.save_settings();
+                }
             });
         });
 
@@ -922,13 +943,38 @@ impl KvmControlPlusApp {
         });
         ui.add_space(6.0);
 
-        egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-            Tab::Devices => self.tab_devices(ui),
-            Tab::Input => self.tab_input(ui),
-            Tab::Macros => self.tab_macros(ui),
-            Tab::Options => self.tab_options(ui),
-            Tab::About => self.tab_about(ui),
-        });
+        let out = egui::ScrollArea::vertical()
+            .id_salt("left-pane")
+            // `auto_shrink([false, false])` is what makes this a real scrolling
+            // viewport: by default the area shrinks to fit its content, so it never
+            // overflows, never draws a scrollbar, and everything below the pane's
+            // bottom edge is unreachable — it just gets clipped.
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.tab {
+                Tab::Devices => self.tab_devices(ui),
+                Tab::Input => self.tab_input(ui),
+                Tab::Macros => self.tab_macros(ui),
+                Tab::Options => self.tab_options(ui),
+                Tab::About => self.tab_about(ui),
+            });
+
+        // Kept permanently: when someone reports "the pane looks cut off", this is
+        // the number that says whether the viewport really was too short (content
+        // taller than the viewport) or the layout handed the pane no room at all.
+        // Logged only when it changes, so it stays readable next to the live log.
+        let geom = (
+            out.inner_rect.width() as i32,
+            out.inner_rect.height() as i32,
+            out.content_size.x as i32,
+            out.content_size.y as i32,
+        );
+        if self.pane_geom_logged != Some(geom) {
+            self.pane_geom_logged = Some(geom);
+            log::trace(format!(
+                "left pane: viewport {}x{}  content {}x{}  (content taller than viewport = scrolling)",
+                geom.0, geom.1, geom.2, geom.3,
+            ));
+        }
         let _ = p;
     }
 
@@ -1505,7 +1551,7 @@ impl KvmControlPlusApp {
                         ))
                         .monospace()
                         .size(11.0)
-                        .color(l.level.color()),
+                        .color(level_color(&p, l.level)),
                     );
                 }
             });
@@ -1666,7 +1712,7 @@ impl eframe::App for KvmControlPlusApp {
                 .show(ui, |ui| self.log_panel(ui));
         }
 
-        if !self.fullscreen_video {
+        if self.show_left_pane && !self.fullscreen_video {
             egui::Panel::left("controls")
                 .resizable(true)
                 .default_size(390.0)
@@ -1697,6 +1743,22 @@ impl eframe::App for KvmControlPlusApp {
 /// glyphs, so they render as empty boxes. ASCII reads correctly everywhere.
 const OK_MARK: &str = "[ok]";
 const NO_MARK: &str = "[NO]";
+
+/// Colour of a log line, resolved against the active theme.
+///
+/// This used to live in `logging::Level::color()`, hard-coded for the dark panel —
+/// INFO was a near-white, which is invisible on the light panel's near-white
+/// background. Colour is a presentation concern and `logging` is a data layer, so
+/// the mapping belongs here where the palette is in hand.
+fn level_color(p: &Palette, level: Level) -> Color32 {
+    match level {
+        Level::Trace => p.dim,
+        Level::Debug => p.dim,
+        Level::Info => p.text,
+        Level::Warn => p.warn,
+        Level::Error => p.bad,
+    }
+}
 
 /// A compact hub name for the UI: `\\?\usb#root_hub30#4&…` → `root_hub30`.
 fn hub_short(path: &str) -> String {

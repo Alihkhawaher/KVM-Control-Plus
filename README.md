@@ -8,6 +8,24 @@ the serial link.
 This is a rewrite of the C#/WinUI3 `Control3`, rebuilt in Rust around a hard
 constraint: **two dependencies, total.**
 
+## Screenshots
+
+![The Devices tab, showing the measured USB link report](docs/screenshots/main-dark.png)
+
+*The **Devices** tab. The "Link & formats" report is measured from the USB hub rather
+than guessed — this dongle negotiated **USB 3.x SuperSpeed**, so uncompressed formats
+are actually viable here. Both values change if you move it to another port.*
+
+![The controls pane hidden, video filling the window](docs/screenshots/pane-hidden.png)
+
+*"Hide pane" collapses the controls for a video-only view. The button stays in the top
+bar ("Show pane" now) and the choice is remembered between runs.*
+
+![The same window in the light theme](docs/screenshots/light-theme.png)
+
+*The light theme. The log panel is the app's own ring buffer, not a console.*
+
+
 ## Why it is lean, on purpose
 
 ```toml
@@ -32,7 +50,7 @@ runtime, no DLL folder, and no installer.
 
 ### What actually ships
 
-**One file: `KVM-Control-Plus.exe`, 7.3 MB.** No DLLs, no assets folder, no config to
+**One file: `KVM-Control-Plus.exe`, 7.9 MB.** No DLLs, no assets folder, no config to
 install, no runtime to download.
 
 Verified against the PE import table: the binary imports **23 libraries, every
@@ -96,6 +114,35 @@ Uncompressed 1080p needs 155–207 MB/s. A USB 2.0 link carries about 40 MB/s. O
 a USB 2.0 link **only MJPEG can work** — an uncompressed selection will "stream"
 fine and show you filler frames forever. The app says so instead of leaving you
 to work it out.
+
+**Hide pane** in the top bar collapses the controls for a video-only window, which is
+what you want once a session is running; the choice is remembered in the settings file
+and the button stays reachable either way. The pane scrolls — its content is roughly
+twice the height of a normal window — so its scroll bar is drawn *solid* rather than
+egui's default, which fades the handle to invisible while idle and makes a long pane
+look like it was simply cut off.
+
+### The window, and the console
+
+The exe is built as a **console** application on purpose: the headless modes below have
+to behave like ordinary command-line tools — output on the terminal, the shell waits for
+them, the exit status means something.
+
+The cost is that a double-click would also open a console showing the same log the GUI
+panel already carries. So the app gives that console back to Windows *before it draws
+anything* — but only when it is the **sole owner** of it. If `cmd.exe` or PowerShell is
+sharing the console, detaching would close your terminal and swallow the output you ran
+the command for, so it is left strictly alone.
+
+| How you start it | Console |
+|---|---|
+| Double-click, no flags | none ever appears |
+| Double-click with `--trace` / `--level …` | none — that is still the GUI |
+| `--list-devices`, `--usb`, `--snapshot …` from a terminal | kept: output, waiting and exit code as normal |
+
+Nothing is lost or silenced by this. Verbose logging is a first-class feature of the
+project (see *Project policy*): every line still goes to the in-memory ring buffer that
+feeds the panel, and the first line the panel shows says the console was detached.
 
 ### Headless modes
 

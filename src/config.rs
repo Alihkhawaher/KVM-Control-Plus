@@ -58,6 +58,9 @@ pub struct Settings {
     pub theme: String,
     /// Minimum level shown in the log panel (`trace|debug|info|warn|error`).
     pub log_level: String,
+    /// Whether the left controls pane starts visible. Hiding it leaves the video
+    /// pane the full width of the window; the top-bar toggle brings it back.
+    pub show_left_pane: bool,
 
     /// Keys we did not recognise, kept verbatim so nothing is lost on save.
     pub unknown: BTreeMap<String, String>,
@@ -90,6 +93,7 @@ impl Default for Settings {
             panic_hotkey_enabled: true,
             theme: "dark".into(),
             log_level: "info".into(),
+            show_left_pane: true,
             unknown: BTreeMap::new(),
         }
     }
@@ -180,6 +184,7 @@ impl Settings {
         out.push_str("\n[ui]\n");
         kv(&mut out, "theme", &self.theme);
         kv(&mut out, "log_level", &self.log_level);
+        kv(&mut out, "show_left_pane", &self.show_left_pane.to_string());
         for (k, v) in &self.unknown {
             kv(&mut out, k, v);
         }
@@ -220,6 +225,7 @@ impl Settings {
                 "fullscreen_on_open" => s.fullscreen_on_open = parse_bool(&v),
                 "theme" => s.theme = v,
                 "log_level" => s.log_level = v,
+                "show_left_pane" => s.show_left_pane = parse_bool(&v),
                 other => {
                     s.unknown.insert(other.to_string(), v);
                 }

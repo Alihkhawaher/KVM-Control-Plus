@@ -409,6 +409,11 @@ fn main() -> eframe::Result<()> {
     }
 
     // ---- GUI ---------------------------------------------------------------
+    // Reaching here means no mode flag was given, so this run *is* the GUI: give
+    // back the console Windows opened for us (see `detach_own_console`) before
+    // anything is drawn. Modes above keep their console untouched.
+    detach_own_console();
+
     let settings = Settings::load();
     logging::set_panel_level(Level::parse(&settings.log_level).unwrap_or(Level::Info));
 
@@ -427,6 +432,51 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(app::KvmControlPlusApp::new(cc)))),
     )
+}
+
+/// Close the console window Windows opened for us, because this run is the GUI.
+///
+/// The binary is deliberately built as a **console** application: the headless
+/// modes (`--list-devices`, `--usb`, `--snapshot`, …) print to stdout and have to
+/// behave like ordinary command-line tools — output on the terminal, the shell
+/// waits for them, the exit status is real. The price is that a double-click also
+/// opens a console nobody asked for, duplicating the log the GUI panel already
+/// shows.
+///
+/// So the console is detached **only when this process is its sole owner**. If
+/// cmd.exe or PowerShell shares it, `GetConsoleProcessList` reports more than one
+/// entry and detaching would close the user's own terminal and swallow the output
+/// they ran the command for — so it is left strictly alone. Zero entries means no
+/// console was ever attached (bash/mintty, a shortcut, a service) and there is
+/// nothing to give back.
+///
+/// Order matters: the logger stops writing to stderr *before* the handle dies,
+/// because Rust's `eprintln!` panics on a failed write. Logging itself keeps
+/// running into the ring buffer — that is what feeds the panel — so nothing is
+/// lost or silenced; see `logging::detach_stdout`.
+fn detach_own_console() {
+    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+
+    // SAFETY: the windows crate takes the buffer as a slice, so it can only write
+    // within bounds; `FreeConsole` takes no arguments and no other pointer is used.
+    unsafe {
+        let mut pids = [0u32; 4];
+        let attached = GetConsoleProcessList(&mut pids);
+
+        if attached == 1 {
+            logging::detach_stdout();
+            match FreeConsole() {
+                Ok(()) => logging::info(
+                    "console detached — this run owns no terminal, so the log lives in the panel",
+                ),
+                Err(e) => logging::warn(format!("could not detach the console: {e}")),
+            }
+        } else {
+            logging::debug(format!(
+                "console kept: {attached} process(es) share it with us"
+            ));
+        }
+    }
 }
 
 /// The window / taskbar icon.

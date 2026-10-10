@@ -4,7 +4,7 @@ Living document. Updated as work lands. `[x]` = done and verified on real
 hardware, `[~]` = coded but not yet exercised against a live source, `[ ]` = not
 started.
 
-Last updated: round 3 (GUI link/format report + USB speed measurement).
+Last updated: round 4 (console handling, pane toggle, screenshots, public release).
 
 ---
 
@@ -67,6 +67,29 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
 - [x] **CLI verification modes** — `--version`, `--list-ports`, `--list-devices`,
       `--list-formats N`, `--probe`, `--usb`, `--snapshot`, `--raw-probe`,
       `--grab-native`. These are how the capture problem was diagnosed.
+- [x] **Console handling** — the binary stays a *console* subsystem app so the
+      headless modes behave like real command-line tools, but a GUI launch gives
+      the console back to Windows when the process is its **sole owner**
+      (`GetConsoleProcessList` == 1 → `FreeConsole`). A console shared with
+      cmd/PowerShell is never touched, so terminal output, the shell waiting and
+      the exit code all keep working. The logger stops writing to the stream
+      *first*, because `eprintln!` panics on a failed write. Verified by launching
+      through `Start-Process` (which allocates a new console, the double-click
+      case) and confirming the process owns exactly one window — the GUI.
+- [x] **Hide the left pane** — top-bar toggle, persisted as `show_left_pane`. The
+      button stays in the top bar in both states (and reads "Show pane" when the
+      pane is away) so the controls are never unreachable.
+- [x] **Pane scrolling** — `auto_shrink([false, false])` on the pane's `ScrollArea`
+      plus `ScrollStyle::solid()`. Without the first, the area grew to its content
+      so it never overflowed and nothing below the fold was reachable; without the
+      second, egui's floating bar is drawn at *zero* opacity when idle, so a long
+      pane looked simply cut off. Measured: content ~1360px vs viewport 150–590px.
+- [x] **Light-theme legibility** — `Level::color()` hard-coded colours for the dark
+      panel (INFO was near-white, invisible on the light background). The mapping
+      moved to the UI layer as `level_color(&palette, level)`.
+- [x] **README screenshots** — `docs/screenshots/`: `main-dark`, `pane-hidden`,
+      `light-theme`, each captured from the running app and checked by eye.
+- [x] **Published** — public MIT repository, `v0.1.1` release with the exe attached.
 
 ## Not done
 
@@ -85,10 +108,11 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
 - [ ] **Macros** — the tab exists, the recorder/player does not.
 - [ ] **Clipboard / file transfer** over the serial link (the original app had
       nothing like it; would be a differentiator).
-- [ ] **`README.md` / `docs/CODE_MAP.md`** — README done, code map done; keep
-      both current as modules change.
-- [ ] **Signature / packaging.** Currently a bare `.exe`; no installer by design
-      (eframe links statically), but no icon/signing either.
+- [x] **`README.md` / `docs/CODE_MAP.md`** — README with screenshots, code map, and
+      the diagnostics doc are all current as of round 4.
+- [ ] **Signature / packaging.** Currently a bare (icon-bearing) `.exe` with real
+      version info; no installer by design (eframe links statically), and no code
+      signing certificate.
 
 ## Known limitations (documented, not bugs)
 
