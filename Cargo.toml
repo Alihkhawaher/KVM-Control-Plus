@@ -1,0 +1,79 @@
+[package]
+name = "kvm-control-plus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Laptop-as-KVM: view a remote machine's video capture and drive its keyboard/mouse over a CH9329 serial cable."
+license = "MIT"
+build = "build.rs"
+
+[[bin]]
+# Hyphenated, no space: this is the exe name. `KVM-Control Plus` (with a space)
+# would produce "KVM-Control Plus.exe", which is awkward on a command line.
+name = "KVM-Control-Plus"
+path = "src/main.rs"
+
+[dependencies]
+# ============================================================================
+#  LEAN BY DESIGN — the entire app is built on TWO dependencies.
+#
+#  * eframe (re-exports egui) : the GUI. Immediate-mode, renders through OpenGL,
+#    links statically -> no runtime, no DLL folder, no installer.
+#  * windows                  : every bit of platform plumbing — Win32 window
+#    message pump for input hooks, Raw Input, SetupAPI device enumeration,
+#    MediaFoundation video capture (which also decodes MJPG for us), and the
+#    serial port (CreateFile/SetCommState/ReadFile/WriteFile).
+#
+#  Deliberately NOT used: serialport, nokhwa, image, serde, anyhow,
+#  crossbeam-channel — each replaced by a small amount of code on top of
+#  the `windows` crate. Settings use a hand-rolled key/value format.
+# ============================================================================
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",   # OpenGL renderer: lightest backend, no wgpu/DX12 stack
+    "x11",
+    "wayland",
+] }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    # ---- Win32 window + input (hooks, raw input, message pump) ----
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Registry",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_Communication",
+    # ---- USB hub IOCTLs: measure the real negotiated link speed ----
+    "Win32_Devices_Usb",
+    # ---- SetupAPI: enumerate serial ports with friendly name + hardware id ----
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    # ---- MediaFoundation: capture-device enumeration + frame grab ----
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_KernelStreaming",
+    # ---- gates that the above APIs really live behind ----
+    "Win32_Security",              # CreateFileW takes SECURITY_ATTRIBUTES
+    "Win32_System_IO",             # ReadFile / WriteFile
+    "Win32_Graphics_Gdi",          # WNDCLASSW / RegisterClassW live behind GDI
+    "Win32_System_SystemServices", # MAXDWORD
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+# Verbose logging is a permanent feature (user policy) and debug builds must
+# stay quick to launch, so keep a light optimization level.
+opt-level = 1
+debug = true

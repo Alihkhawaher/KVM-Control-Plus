@@ -1,0 +1,9 @@
+# Static C runtime: the .exe must not depend on VCRUNTIME140.dll / the VC++
+# redistributable. Without this, KVM-Control-Plus.exe imports VCRUNTIME140.dll plus a
+# dozen api-ms-win-crt-* shims, so "one file, no installer" would only be true
+# on a machine that already had the redistributable installed.
+#
+# Cost: ~170 KB of binary size. Benefit: the shipped artifact is genuinely one
+# file that runs on a bare Windows install.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

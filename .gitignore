@@ -1,0 +1,5 @@
+/target
+
+# Scratch output from the CLI diagnostic modes (--snapshot, --grab-native, logs).
+# These are working artifacts, not sources.
+/out
