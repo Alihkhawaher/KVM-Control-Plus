@@ -102,9 +102,98 @@ pub fn stdout_attached() -> bool {
     STDOUT_ATTACHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The on-disk log for this run, when the console has been given up.
+///
+/// Born from a specific failure: on 2026-10-11 this app died of a failed
+/// allocation, and the one line that would have said *how big* the allocation was
+/// — Rust prints that to stderr itself — went to a console that had already been
+/// detached. Nothing survived. Now a GUI run writes everything to a file and aims
+/// the process's stderr at it, so the runtime's own fatal messages land somewhere
+/// readable too. See `docs/CRASH_2026-10-11.md`.
+struct FileSink {
+    file: std::fs::File,
+    written: u64,
+    capped: bool,
+}
+
+/// A hard cap on the log file, so a chatty run cannot fill the disk. The
+/// in-memory ring buffer keeps going regardless — this bounds bytes, not logging.
+const LOG_FILE_CAP: u64 = 32 * 1024 * 1024;
+
+static LOG_FILE: OnceLock<Mutex<Option<FileSink>>> = OnceLock::new();
+
+/// Send this run's log to `path`, and point the process's stderr at the same file.
+///
+/// Returns false if the file cannot be opened, in which case the caller must fall
+/// back to [`detach_stdout`] before giving the console up — writing to a detached
+/// console makes `eprintln!` panic.
+///
+/// The stderr redirect is **best effort**: Rust may have cached the console's
+/// handle before this is called, in which case only our own records (written
+/// directly, above) reach the file. Nothing here depends on it succeeding.
+#[cfg(windows)]
+pub fn redirect_stderr_to_file(path: &std::path::Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    // Aim stderr at the same file, so anything that writes to stderr — including
+    // the Rust runtime's "memory allocation of N bytes failed" — is captured.
+    unsafe {
+        let handle = windows::Win32::Foundation::HANDLE(file.as_raw_handle() as _);
+        let _ = windows::Win32::System::Console::SetStdHandle(
+            windows::Win32::System::Console::STD_ERROR_HANDLE,
+            handle,
+        );
+    }
+
+    let _ = LOG_FILE.set(Mutex::new(Some(FileSink {
+        file,
+        written: 0,
+        capped: false,
+    })));
+    true
+}
+
+/// Append one record to the on-disk log, respecting the cap.
+fn write_to_file(level: Level, message: &str) {
+    let Some(slot) = LOG_FILE.get() else {
+        return;
+    };
+    let mut guard = slot.lock().unwrap();
+    let Some(sink) = guard.as_mut() else {
+        return;
+    };
+    if sink.capped {
+        return;
+    }
+    use std::io::Write;
+    // Unbuffered on purpose: a crash must not lose the lines that explain it.
+    let line = format!("[{}] {message}\n", level.tag());
+    if sink.file.write_all(line.as_bytes()).is_err() {
+        return;
+    }
+    sink.written += line.len() as u64;
+    if sink.written >= LOG_FILE_CAP {
+        sink.capped = true;
+        let _ = sink
+            .file
+            .write_all(b"[WARN ] log file reached its size cap; the in-memory log continues\n");
+    }
+}
+
 /// Record a line at `level`.
 pub fn log(level: Level, message: impl Into<String>) {
     let message = message.into();
+    write_to_file(level, &message);
     let mut s = state().lock().unwrap();
     if level >= s.stdout_level && stdout_attached() {
         eprintln!("[{}] {message}", level.tag());

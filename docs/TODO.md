@@ -4,7 +4,7 @@ Living document. Updated as work lands. `[x]` = done and verified on real
 hardware, `[~]` = coded but not yet exercised against a live source, `[ ]` = not
 started.
 
-Last updated: round 5 (correct colour range/matrix, low-latency capture, measured pipeline latency).
+Last updated: round 6 (bounded frame path — fixes the 2026-10-11 out-of-memory crash).
 
 ---
 
@@ -86,6 +86,28 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
       `width × 4` (an RGB32 leftover) while an NV12 buffer was being read; the
       conversion ignored the reported stride entirely. Both now use the pitch the
       media type reports.
+- [x] **Bounded frame path — this fixes the 2026-10-11 out-of-memory crash.** Frames
+      used to be handed to the UI through an **unbounded** `mpsc::channel()`; a UI
+      that stops collecting (a minimised window never receives `RedrawRequested` on
+      Windows) let 6 MB frames pile up until the machine's commit ran out, taking
+      `dwm.exe` and WhatsApp with it — twice, at 452 GiB and 445 GiB of commit.
+      Frames now wait in `video::mf::FrameSlot`, which holds **one** frame: a newer
+      one replaces the waiting one, so the queue is one frame long whatever the UI
+      does. Post-mortem with the measured numbers: `docs/CRASH_2026-10-11.md`.
+- [x] **Producer backpressure.** If nothing has been collected for two seconds, the
+      capture loop keeps reading samples (so the picture is current the moment the
+      window comes back) but stops converting them — a stalled UI costs no CPU.
+- [x] **A ceiling on committed memory.** `src/proc_mem.rs` checks the process's
+      commit once a second; past 4 GiB (or `KVM_MAX_COMMIT_MB`) capture stops and says
+      so. A bug should be able to damage this app, never the machine it runs on. A
+      malformed override cannot remove the ceiling — tested.
+- [x] **A durable log for GUI runs.** `%APPDATA%\KVM-Control Plus\last-run.log`, with
+      stderr aimed at the same file, so a fatal message from the runtime itself (a
+      failed allocation, for one) is still there afterwards. Previously the console
+      had been detached and nothing survived.
+- [x] **`--soak <seconds>` — the regression harness.** Runs capture with nobody
+      collecting and prints committed memory, so "this cannot happen again" is a
+      measurement: 61 frames, 0 collected, memory flat at 9.9 MB.
 - [x] **CLI verification modes** — `--version`, `--list-ports`, `--list-devices`,
       `--list-formats N`, `--probe`, `--usb`, `--snapshot`, `--raw-probe`,
       `--grab-native`. These are how the capture problem was diagnosed.

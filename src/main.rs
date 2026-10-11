@@ -17,6 +17,7 @@ mod config;
 mod input;
 mod kvm;
 mod logging;
+mod proc_mem;
 mod ui;
 mod video;
 
@@ -306,6 +307,13 @@ fn main() -> eframe::Result<()> {
     }
 
     // ---- grab a single frame to a BMP file (proves the whole video path) ----
+    // ---- soak: the regression harness for the 2026-10-11 out-of-memory crash --
+    if let Some(i) = args.iter().position(|a| a == "--soak") {
+        let secs: u64 = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(30);
+        let which = args.get(i + 2).cloned().unwrap_or_default();
+        return soak(&which, secs);
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--snapshot") {
         let out = args
             .get(i + 1)
@@ -330,13 +338,16 @@ fn main() -> eframe::Result<()> {
 
         println!("grabbing one frame from {}", device.name);
         let (tx, rx) = std::sync::mpsc::channel();
+        // Frames arrive in the slot, control messages on the channel.
+        let frames = video::mf::FrameSlot::new();
         let mut capture = match video::mf::CaptureThread::start(
             device.symbolic_link.clone(),
             String::new(),
             false,
             tx,
-            // No UI to wake: this mode polls the channel itself.
+            // No UI to wake: this mode polls the slot itself.
             Box::new(|| {}),
+            frames.clone(),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -352,27 +363,8 @@ fn main() -> eframe::Result<()> {
         // prefer to wait for a frame with real picture in it.
         let mut blank_fallback: Option<video::Frame> = None;
         while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(video::CaptureMsg::Frame(frame)) => {
-                    if frame.looks_blank() {
-                        blank_fallback = Some(frame);
-                        continue;
-                    }
-                    match video::write_bmp(std::path::Path::new(&out), &frame) {
-                        Ok(()) => {
-                            println!(
-                                "wrote {} ({}x{}, {:.1}% lit)",
-                                out,
-                                frame.width,
-                                frame.height,
-                                frame.lit_fraction() * 100.0
-                            );
-                            wrote = true;
-                        }
-                        Err(e) => eprintln!("could not write {out}: {e}"),
-                    }
-                    break;
-                }
+            // Control messages arrive on the channel; frames sit in the slot.
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(video::CaptureMsg::Started {
                     width,
                     height,
@@ -386,8 +378,28 @@ fn main() -> eframe::Result<()> {
                     eprintln!("  stream stopped: {e}");
                     break;
                 }
-                Err(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
+            let Some(frame) = frames.take() else { continue };
+            if frame.looks_blank() {
+                blank_fallback = Some(frame);
+                continue;
+            }
+            match video::write_bmp(std::path::Path::new(&out), &frame) {
+                Ok(()) => {
+                    println!(
+                        "wrote {} ({}x{}, {:.1}% lit)",
+                        out,
+                        frame.width,
+                        frame.height,
+                        frame.lit_fraction() * 100.0
+                    );
+                    wrote = true;
+                }
+                Err(e) => eprintln!("could not write {out}: {e}"),
+            }
+            break;
         }
         if !wrote {
             if let Some(frame) = blank_fallback {
@@ -415,6 +427,10 @@ fn main() -> eframe::Result<()> {
     // Reaching here means no mode flag was given, so this run *is* the GUI: give
     // back the console Windows opened for us (see `detach_own_console`) before
     // anything is drawn. Modes above keep their console untouched.
+    match start_run_log() {
+        Some(p) => logging::info(format!("this run logs to {}", p.display())),
+        None => logging::warn("could not open a log file for this run"),
+    }
     detach_own_console();
 
     let settings = Settings::load();
@@ -504,29 +520,187 @@ fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
     })
 }
 
-fn print_help() {
+/// Give this run a durable log file, then let the console go.
+///
+/// Why this exists: on 2026-10-11 the app died of a failed allocation, and the one
+/// line that would have said *how big* the allocation was — Rust prints that to
+/// stderr itself — went to a console that had already been detached. Nothing
+/// survived to read. A GUI run now logs to a file, so the next fatal message is
+/// still there afterwards; see `docs/CRASH_2026-10-11.md`.
+fn start_run_log() -> Option<std::path::PathBuf> {
+    let path = crate::config::Settings::path()
+        .parent()?
+        .join("last-run.log");
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    if !logging::redirect_stderr_to_file(&path) {
+        return None;
+    }
+    // The file owns stderr now; our own records must not also be written to a
+    // console that is about to be given back to Windows.
+    logging::detach_stdout();
+    Some(path)
+}
+
+/// Resolve a capture device by index, by name, or to the first one available.
+fn pick_device(which: &str) -> Option<video::mf::VideoDevice> {
+    let devices = video::mf::list_devices().ok()?;
+    if !which.is_empty() {
+        if let Some(d) = devices
+            .iter()
+            .find(|d| d.index.to_string() == which || d.name == which)
+        {
+            return Some(d.clone());
+        }
+    }
+    devices.first().cloned()
+}
+
+/// Run capture with **nobody collecting frames**, and measure what it costs.
+///
+/// This is the regression harness for the 2026-10-11 crash
+/// (`docs/CRASH_2026-10-11.md`): an unbounded queue of frames filled the machine's
+/// memory and took the desktop's compositor down with it. The fix is that a frame
+/// now waits in a single slot (`video::mf::FrameSlot`), so this mode reproduces
+/// the exact condition that used to be fatal — a producer with no consumer — and
+/// prints the process's committed memory while it happens. That turns "this
+/// cannot happen again" into a measurement instead of a promise.
+///
+/// It deliberately never takes a frame. Three things should be visible:
+///   * committed memory stays flat instead of climbing by 6 MB per frame,
+///   * `produced` stops climbing after a couple of seconds, because the producer
+///     backs off once it sees that nothing is being collected,
+///   * with `KVM_MAX_COMMIT_MB` set low, the ceiling stops the stream outright.
+fn soak(which: &str, secs: u64) -> eframe::Result<()> {
+    let Some(device) = pick_device(which) else {
+        eprintln!("no capture device to soak (try --list-devices)");
+        std::process::exit(1);
+    };
+
     println!(
-        "kvm-control-plus {VERSION} — laptop-as-KVM: USB capture + CH9329 serial HID\n\
-         \n\
-         USAGE:\n\
-         \x20   kvm-control-plus [OPTIONS]\n\
-         \n\
-         With no options, the GUI starts.\n\
-         \n\
-         INSPECTION (no GUI):\n\
-         \x20   --list-devices              list MediaFoundation capture devices\n\
-         \x20   --list-formats [DEVICE]     list a device's native formats (index or name)\n\
-         \x20   --list-ports                list serial ports, flagging known KVM cables\n\
-         \x20   --probe [COM]               open the cable and read CH9329 chip info\n\
-         \n\
-         LOGGING:\n\
-         \x20   -q, --quiet                 warnings and errors only\n\
-         \x20   -v, --verbose, --debug      debug detail (default: info)\n\
-         \x20   --trace                     everything, including per-packet tracing\n\
-         \x20   --level <trace|debug|info|warn|error>\n\
-         \n\
-         MISC:\n\
-         \x20   -V, --version               version and build timestamp\n\
-         \x20   -h, --help                  this help"
+        "soaking \"{}\" for {secs}s with no consumer — ceiling {} MB (change with KVM_MAX_COMMIT_MB)",
+        device.name,
+        crate::proc_mem::mb(crate::proc_mem::ceiling_bytes()).round()
+    );
+    println!(
+        "{:>5}  {:>11}  {:>10}  {:>10}",
+        "t(s)", "commit(MB)", "produced", "collected"
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let frames = video::mf::FrameSlot::new();
+    let mut capture = match video::mf::CaptureThread::start(
+        device.symbolic_link.clone(),
+        String::new(),
+        false,
+        tx,
+        // Nobody collects: that is the entire point of this mode.
+        Box::new(|| {}),
+        frames.clone(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("capture failed to start: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let mut stopped: Option<String> = None;
+    let mut peak = 0u64;
+    while start.elapsed() < std::time::Duration::from_secs(secs) {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Control messages are read; frames are deliberately left in the slot.
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                video::CaptureMsg::Stopped(why) => stopped = Some(why),
+                video::CaptureMsg::Warning(w) => println!("  warn: {w}"),
+                video::CaptureMsg::Started { .. } => {}
+            }
+        }
+        let (put, taken) = frames.counters();
+        let commit = crate::proc_mem::commit_bytes();
+        peak = peak.max(commit);
+        println!(
+            "{:>5}  {:>11.1}  {:>10}  {:>10}",
+            start.elapsed().as_secs(),
+            crate::proc_mem::mb(commit),
+            put,
+            taken
+        );
+        if let Some(why) = &stopped {
+            println!("\nstream stopped during the soak: {why}");
+            break;
+        }
+    }
+
+    capture.stop();
+    let (put, taken) = frames.counters();
+    println!(
+        "\nproduced {put}, collected {taken}, peak commit {:.1} MB, ceiling {:.0} MB",
+        crate::proc_mem::mb(peak),
+        crate::proc_mem::mb(crate::proc_mem::ceiling_bytes())
+    );
+
+    // The assertion that matters: memory must not track the frame count. A 1080p
+    // frame is 6,220,800 bytes, so the old design was into gigabytes within
+    // seconds; anything near this bound means the bound is not holding.
+    if peak >= 256 * 1024 * 1024 {
+        println!(
+            "FAIL — committed {:.0} MB with no consumer: a stalled UI is still costing memory",
+            crate::proc_mem::mb(peak)
+        );
+        std::process::exit(2);
+    }
+    if stopped.is_some() {
+        println!(
+            "       (the stream was stopped early by the memory ceiling — the watchdog working)"
+        );
+    }
+    println!("PASS — {put} frames produced with nobody collecting, memory stayed flat");
+    if taken == 0 {
+        println!("       (nothing was collected, which is exactly what this mode tests)");
+    }
+    Ok(())
+}
+
+fn print_help() {
+    // Written as a raw string, one line per line: no line-continuation escapes and
+    // no padding tricks, so what you read here is exactly what is printed. The
+    // previous form leaned on trailing-backslash continuations, which printed
+    // literal escape text the moment one was edited carelessly.
+    println!(
+        r#"kvm-control-plus {VERSION} — laptop-as-KVM: USB capture + CH9329 serial HID
+
+USAGE:
+    kvm-control-plus [OPTIONS]
+
+With no options, the GUI starts.
+
+INSPECTION (no GUI):
+    --list-devices              list MediaFoundation capture devices
+    --list-formats [DEVICE]     list a device's native formats (index or name)
+    --list-ports                list serial ports, flagging known KVM cables
+    --probe [COM]               open the cable and read CH9329 chip info
+
+DIAGNOSTICS:
+    --usb                       measure the real negotiated USB link speed
+    --snapshot <file> [DEVICE]  write one frame to a .bmp
+    --raw-probe [DEVICE]        walk the native formats, report which ones stream
+    --soak <seconds> [DEVICE]   run capture with nobody collecting, and measure
+                                that the frame path cannot grow without bound
+
+LOGGING:
+    -q, --quiet                 warnings and errors only
+    -v, --verbose, --debug      debug detail (default: info)
+    --trace                     everything, including per-packet tracing
+    --level <trace|debug|info|warn|error>
+
+MISC:
+    -V, --version               version and build timestamp
+    -h, --help                  this help
+
+ENVIRONMENT:
+    KVM_MAX_COMMIT_MB           ceiling on this app's committed memory, in MB
+                                (default 4096). A bad value cannot remove it."#
     );
 }

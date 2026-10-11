@@ -16,10 +16,11 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
@@ -559,6 +560,11 @@ impl Frame {
 }
 
 /// Messages from the capture thread.
+///
+/// **Frames are deliberately not here.** They travel through [`FrameSlot`], which
+/// holds exactly one frame; this channel carries only the rare, small, one-off
+/// messages. Putting frames on an unbounded channel is what took this machine's
+/// desktop down on 2026-10-11 — see `docs/CRASH_2026-10-11.md`.
 pub enum CaptureMsg {
     /// The stream is live, at this size/framerate.
     Started {
@@ -568,7 +574,6 @@ pub enum CaptureMsg {
         /// How the arriving samples are being read, for the UI to show.
         colour: String,
     },
-    Frame(Frame),
     /// Non-fatal problem (e.g. a dropped sample).
     Warning(String),
     /// The stream ended or failed.
@@ -584,15 +589,20 @@ pub struct CaptureThread {
 impl CaptureThread {
     /// Start streaming `symbolic_link`, preferring `format_label` (empty = auto).
     ///
-    /// `wake` is called after every message is queued. The UI must redraw when a
-    /// frame lands, and the alternative — redrawing as fast as the display
-    /// allows, hoping to notice one — burns a core and adds jitter.
+    /// `wake` is called after every frame is stored. The UI must redraw when a frame
+    /// lands, and the alternative — redrawing as fast as the display allows, hoping
+    /// to notice one — burns a core and adds jitter.
+    ///
+    /// `frames` is the single-slot hand-off to the UI. The caller keeps a clone;
+    /// **nothing here needs to read it** for frames to arrive (the `--snapshot` and
+    /// `--soak` modes poll it directly).
     pub fn start(
         symbolic_link: String,
         format_label: String,
         flip_vertical: bool,
         tx: Sender<CaptureMsg>,
         wake: Box<dyn Fn() + Send>,
+        frames: FrameSlot,
     ) -> Result<CaptureThread, String> {
         ensure_started()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -608,6 +618,7 @@ impl CaptureThread {
                     &tx,
                     &stop_thread,
                     &wake,
+                    &frames,
                 ) {
                     let _ = tx.send(CaptureMsg::Stopped(e));
                     wake();
@@ -638,6 +649,126 @@ impl Drop for CaptureThread {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  The frame slot: one frame, newest wins
+// ---------------------------------------------------------------------------
+
+/// How long the UI may collect nothing before the producer stops converting.
+///
+/// Deliberately generous: a *visible* window is woken by [`CaptureThread::start`]'s
+/// `wake` callback on every frame, so it collects continuously; two seconds of
+/// silence means the window is not being drawn at all (minimised, hidden — on
+/// Windows those never receive `RedrawRequested`), not that it is briefly busy.
+const BACKPRESSURE_QUIET: Duration = Duration::from_secs(2);
+
+/// How long the producer sleeps per loop while nobody is collecting. It keeps
+/// reading samples throughout, so the reader stays drained and the picture is
+/// current the moment the window comes back.
+const BACKPRESSURE_SLEEP: Duration = Duration::from_millis(50);
+
+/// Where a captured frame waits for the UI — and the reason this app cannot grow
+/// without bound.
+///
+/// A channel was the obvious choice and it was the wrong one:
+/// `std::sync::mpsc::channel()` is **unbounded**, so a consumer that stops
+/// consuming costs nothing at all until the queue has eaten the machine.
+/// That is not hypothetical here. On 2026-10-11 this app reached 478 GB of
+/// commit and took the desktop's compositor down with it, and the arithmetic
+/// identifies the contents exactly:
+///
+/// ```text
+/// 478,142,341,120 / 6,220,800  (one 1080p RGB frame) = 76,861.9 frames
+/// 485,745,373,184 / 6,220,800                        = 78,084.1 frames
+/// ```
+///
+/// A consumer legitimately *does* stop: on Windows a minimised or invisible
+/// window never receives `RedrawRequested` — eframe documents that special case
+/// itself — so the UI can stop collecting for hours while capture keeps producing
+/// ~6 MB per frame.
+///
+/// So the slot holds exactly **one** frame. A newer frame replaces (and frees)
+/// whatever was waiting, which is also what live video actually wants: draw the
+/// newest frame, never a backlog. Memory is bounded by construction, not by the
+/// UI being well behaved.
+#[derive(Clone)]
+pub struct FrameSlot(Arc<FrameSlotInner>);
+
+struct FrameSlotInner {
+    cell: Mutex<Option<Frame>>,
+    /// Frames stored by the producer and frames collected by the UI; the gap
+    /// between them is how the producer knows nobody is drawing.
+    put: AtomicU64,
+    taken: AtomicU64,
+    /// Milliseconds from `born` to the last collection.
+    last_take_ms: AtomicU64,
+    born: Instant,
+}
+
+impl FrameSlot {
+    pub fn new() -> Self {
+        FrameSlot(Arc::new(FrameSlotInner {
+            cell: Mutex::new(None),
+            put: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
+            last_take_ms: AtomicU64::new(0),
+            born: Instant::now(),
+        }))
+    }
+
+    /// Store the newest frame. Whatever was waiting is dropped right here — that
+    /// *is* the bound: the slot can hold one frame, forever.
+    pub fn put(&self, frame: Frame) {
+        let mut cell = self.0.cell.lock().unwrap();
+        *cell = Some(frame);
+        self.0.put.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take the newest frame, if one is waiting.
+    pub fn take(&self) -> Option<Frame> {
+        let mut cell = self.0.cell.lock().unwrap();
+        let frame = cell.take();
+        if frame.is_some() {
+            self.0.taken.fetch_add(1, Ordering::Relaxed);
+            self.0
+                .last_take_ms
+                .store(self.0.born.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+        frame
+    }
+
+    /// Is a frame waiting to be drawn?
+    pub fn pending(&self) -> bool {
+        self.0.cell.lock().unwrap().is_some()
+    }
+
+    /// Frames produced, frames collected — logged, so the numbers are visible.
+    pub fn counters(&self) -> (u64, u64) {
+        (
+            self.0.put.load(Ordering::Relaxed),
+            self.0.taken.load(Ordering::Relaxed),
+        )
+    }
+
+    /// True when a frame is waiting *and* nothing has been collected for `quiet`.
+    ///
+    /// The bound already makes a stalled consumer harmless; this stops it being
+    /// *wasteful*, by not decoding 50 frames a second into a slot nobody reads.
+    pub fn quiet_for(&self, quiet: Duration) -> bool {
+        if self.0.cell.lock().unwrap().is_none() {
+            return false;
+        }
+        let since_born_ms = self.0.born.elapsed().as_millis() as u64;
+        let last_ms = self.0.last_take_ms.load(Ordering::Relaxed);
+        since_born_ms.saturating_sub(last_ms) >= quiet.as_millis() as u64
+    }
+}
+
+impl Default for FrameSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn capture_loop(
     symbolic_link: &str,
     format_label: &str,
@@ -645,6 +776,7 @@ fn capture_loop(
     tx: &Sender<CaptureMsg>,
     stop: &AtomicBool,
     wake: &(dyn Fn() + Send),
+    frames: &FrameSlot,
 ) -> Result<(), String> {
     let source = open_source(symbolic_link)?;
     let reader = create_reader(&source)?;
@@ -661,11 +793,43 @@ fn capture_loop(
     });
 
     let mut cb = CaptureBuffers::new();
+    let mut mem_mark = Instant::now();
+    let mut backing_off = false;
     loop {
         // The read below blocks for at most one frame, so checking here keeps
         // `CaptureThread::stop()` responsive.
         if stop.load(Ordering::Relaxed) {
             return Ok(());
+        }
+
+        // ---- the ceiling, checked once a second ----------------------------
+        // The bound in `FrameSlot` means capture can no longer grow without
+        // limit, and this is the backstop for whatever the *next* cause turns out
+        // to be: if this app ever commits more than its ceiling, stop capturing
+        // and say so, instead of growing until the machine's commit runs out and
+        // the desktop's compositor dies with it. That is exactly what happened
+        // on 2026-10-11 (docs/CRASH_2026-10-11.md).
+        if mem_mark.elapsed() >= Duration::from_secs(1) {
+            mem_mark = Instant::now();
+            if let Some(used) = crate::proc_mem::over_ceiling() {
+                let msg = format!(
+                    "committed {:.0} MB, past this app's {:.0} MB ceiling — capture stopped to protect the machine",
+                    crate::proc_mem::mb(used),
+                    crate::proc_mem::mb(crate::proc_mem::ceiling_bytes()),
+                );
+                crate::logging::error(msg.clone());
+                let _ = tx.send(CaptureMsg::Stopped(msg));
+                wake();
+                return Ok(());
+            }
+            // Recorded every second at debug level: enough to plot a trend from
+            // the log if a leak is ever suspected again.
+            let (put, taken) = frames.counters();
+            crate::logging::debug(format!(
+                "memory: {:.0} MB committed of a {:.0} MB ceiling; {put} frames produced, {taken} collected",
+                crate::proc_mem::mb(crate::proc_mem::commit_bytes()),
+                crate::proc_mem::mb(crate::proc_mem::ceiling_bytes()),
+            ));
         }
 
         let mut sample: Option<IMFSample> = None;
@@ -693,9 +857,32 @@ fn capture_loop(
         }
         let Some(sample) = sample else { continue };
 
+        // ---- backpressure --------------------------------------------------
+        // The slot is bounded, so a UI that stops collecting can no longer cost
+        // memory — but it can still cost a core, and a UI that stops collecting
+        // is *normal* on Windows: a minimised window never receives
+        // `RedrawRequested`, so `update()` stops while capture runs on. The
+        // sample just read is dropped, which keeps the reader drained, so the
+        // picture is current the instant the window comes back.
+        if frames.quiet_for(BACKPRESSURE_QUIET) {
+            if !backing_off {
+                backing_off = true;
+                crate::logging::info(format!(
+                    "nothing collected for {} s — pausing conversion until the window draws again",
+                    BACKPRESSURE_QUIET.as_secs()
+                ));
+            }
+            std::thread::sleep(BACKPRESSURE_SLEEP);
+            continue;
+        }
+        if backing_off {
+            backing_off = false;
+            crate::logging::info("window is drawing again — resuming conversion");
+        }
+
         // Stamped as early as possible: everything after this is our latency,
         // and understating it would defeat the measurement.
-        let captured_at = std::time::Instant::now();
+        let captured_at = Instant::now();
 
         match convert_sample(
             &sample,
@@ -707,9 +894,10 @@ fn capture_loop(
             captured_at,
         ) {
             Ok(frame) => {
-                if tx.send(CaptureMsg::Frame(frame)).is_err() {
-                    return Ok(()); // UI closed
-                }
+                // Newest wins. This replaces whatever was waiting, so the queue
+                // is one frame long however long the UI stays away — the bound
+                // is structural, not a promise the UI has to keep.
+                frames.put(frame);
                 // Wake the UI *because* a frame arrived, instead of letting it
                 // spin at the display's refresh rate waiting to notice one.
                 wake();
@@ -1184,6 +1372,60 @@ mod tests {
     #[test]
     fn media_foundation_starts() {
         assert!(ensure_started().is_ok(), "MFStartup should succeed");
+    }
+
+    #[test]
+    fn the_slot_keeps_one_frame_however_many_arrive_uncollected() {
+        // The regression test for the 2026-10-11 crash: a consumer that stops
+        // collecting used to cost 6 MB per frame without limit. Now the slot can
+        // only ever hold one, so a thousand unconsumed frames cost one frame.
+        let slot = FrameSlot::new();
+        for width in 0..1000u32 {
+            slot.put(dummy_frame(width));
+        }
+        assert_eq!(slot.counters(), (1000, 0));
+        assert_eq!(slot.take().map(|f| f.width), Some(999), "newest must win");
+        assert!(slot.take().is_none(), "only one frame may ever be waiting");
+        assert!(!slot.pending());
+    }
+
+    #[test]
+    fn the_slot_knows_when_nobody_is_collecting() {
+        let slot = FrameSlot::new();
+        // Nothing waiting yet: not a stall, just nothing to draw.
+        assert!(!slot.quiet_for(Duration::ZERO));
+
+        slot.put(dummy_frame(1));
+        // A frame is waiting and nothing has ever collected: stalled.
+        assert!(slot.quiet_for(Duration::ZERO));
+        assert!(
+            !slot.quiet_for(Duration::from_secs(3600)),
+            "not stalled *that* long yet"
+        );
+
+        // Collecting clears it, and a fresh frame is not instantly stale.
+        assert!(slot.take().is_some());
+        assert!(
+            !slot.quiet_for(Duration::ZERO),
+            "a collected slot is not stalled"
+        );
+        slot.put(dummy_frame(2));
+        assert!(
+            !slot.quiet_for(Duration::from_secs(60)),
+            "just collected, so not stalled"
+        );
+    }
+
+    /// A frame of the given width with no pixels — the slot tests only care about
+    /// identity and lifetime, not content.
+    fn dummy_frame(width: u32) -> Frame {
+        Frame {
+            width,
+            height: 1,
+            rgb: Vec::new(),
+            flipped: false,
+            captured_at: Instant::now(),
+        }
     }
 
     /// Device enumeration must work (possibly returning zero devices).

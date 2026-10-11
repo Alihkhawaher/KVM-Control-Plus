@@ -52,6 +52,45 @@ redraws when a frame arrives instead of at the display's refresh rate, and chrom
 is read once per 4:2:0 pair rather than per pixel.
 
 
+## Why the frame queue holds exactly one frame
+
+On 2026-10-11 this app committed **478 GB** and took the desktop's compositor down
+with it — twice. The full post-mortem is in
+[`docs/CRASH_2026-10-11.md`](docs/CRASH_2026-10-11.md); the short version is that
+frames went to the UI through an **unbounded channel**, and a queue with no bound is
+only safe as long as its consumer keeps consuming. A UI does not: on Windows a
+minimised or invisible window never receives `RedrawRequested`, so the UI stops
+draining while capture keeps producing 6 MB per frame. The arithmetic names the
+contents exactly — 478,142,341,120 ÷ 6,220,800 = 76,861.9 frames.
+
+Frames now wait in a **single slot**: a newer frame replaces the waiting one. The
+queue is one frame long, always, whatever the UI does. That is also what live video
+wants — the newest frame, never a backlog.
+
+Two more defences sit behind it:
+
+- **Backpressure.** If nothing has been collected for two seconds, the capture loop
+  keeps reading samples (so the picture is current the moment the window returns)
+  but stops converting them. A stalled UI costs no CPU.
+- **A commitment ceiling.** Committed memory is checked once a second; past 4 GiB
+  (override with `KVM_MAX_COMMIT_MB`), capture stops and says so, instead of growing
+  until the machine's memory runs out. A bug should be able to damage this app, never
+  the machine it runs on.
+
+**A GUI run now always leaves a log** at `%APPDATA%\KVM-Control Plus\last-run.log`.
+Before this, the message that would have named the failing allocation went to a
+console the GUI had given back to Windows, so nothing survived the crash.
+
+`--soak <seconds>` reproduces the condition that was fatal — a producer with nobody
+collecting — and prints the committed memory while it runs:
+
+```
+$ KVM-Control-Plus.exe --soak 20
+produced 61, collected 0, peak commit 18.8 MB, ceiling 4096 MB
+PASS — 61 frames produced with nobody collecting, memory stayed flat
+```
+
+
 ## Why it is lean, on purpose
 
 ```toml

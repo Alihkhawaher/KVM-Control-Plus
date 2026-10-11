@@ -26,6 +26,9 @@ KVM-Control Plus/
    │                 binary is a console app so the modes work in a terminal, and a
    │                 double-click therefore gets a console nobody asked for; it is
    │                 given back, but only when this process solely owns it.
+   │                 `--soak` lives here too: it runs capture with nobody
+   │                 collecting and prints the committed memory, so the crash of
+   │                 2026-10-11 is a reproducible measurement rather than a story.
    ├─ app.rs         The application: state machine, tabs, panels, and the
    │                 "link & formats" report. Largest file by design — one place
    │                 to see what the UI does. Holds the pane toggle
@@ -34,8 +37,12 @@ KVM-Control Plus/
    │                 so it does not live in `logging`).
    ├─ config.rs      Settings: hand-rolled `key = value`, no serde. Load is
    │                 once-logged (startup reads it twice).
-   ├─ logging.rs     Ring-buffer logger + Level. Feeds both stdout and the GUI
-   │                 log panel. Levels: trace < debug < info < warn < error.
+   ├─ logging.rs     Ring-buffer logger + Level. Feeds stdout, the GUI log panel,
+   │                 and (for GUI runs) `last-run.log` — a fatal message from the
+   │                 runtime itself must not vanish with the console again.
+   ├─ proc_mem.rs    `GetProcessMemoryInfo`, and the ceiling on this app's commit.
+   │                 Named `over_ceiling`, checked once a second by the capture
+   │                 loop: a bug may damage this app, never the machine it runs on.
    ├─ ui/
    │   ├─ mod.rs     Palette/theme (dark + light) and the small widget kit
    │   │             (section, kv, badge, pill, chip). `kv` truncates over-long
@@ -71,6 +78,11 @@ KVM-Control Plus/
        │             (BT.601/BT.709) off the negotiated media type rather than
        │             assuming, and `yuv_to_rgb` is a pure function so the colour
        │             maths can be tested without a live source.
+       │             `FrameSlot` is the other half of being correct: one frame
+       │             waits in it and a newer one replaces it, so a UI that stops
+       │             collecting (a minimised window never gets painted on Windows)
+       │             cannot make the frame path grow. It used to be an unbounded
+       │             channel, which is what took the desktop down on 2026-10-11.
        └─ usb_link.rs  Real USB link-speed measurement from the hub, plus the
                       arithmetic that decides whether a format can fit.
 ```
@@ -88,8 +100,11 @@ keyboard/mouse ──► input/hook.rs ──► InputEvent ──► app.rs ─
                                                                    │
                                                             CH9329 ──► USB ──► remote PC
 
-MS2130 dongle ──► video/mf.rs (source reader, NV12) ──► NV12→RGB ──► egui texture
-                        │
+MS2130 dongle ──► video/mf.rs (source reader, NV12) ──► NV12→RGB ──► FrameSlot ──► egui
+                        │                                     (holds ONE frame, newest
+                        │                                      wins — a stalled UI
+                        │                                      costs one frame, not
+                        │                                      the machine's memory)
                         └── video/usb_link.rs (how fast is this link, really?)
 ```
 

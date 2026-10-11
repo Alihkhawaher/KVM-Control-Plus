@@ -18,7 +18,7 @@ use crate::kvm::serial_scan::{self, SerialPortInfo};
 use crate::kvm::{ch9329, keymap};
 use crate::logging::{self as log, Level};
 use crate::ui::{self, Palette};
-use crate::video::mf::{self, CaptureMsg, CaptureThread, VideoDevice, VideoFormat};
+use crate::video::mf::{self, CaptureMsg, CaptureThread, FrameSlot, VideoDevice, VideoFormat};
 
 /// Which controls the left panel is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +76,12 @@ pub struct KvmControlPlusApp {
     cable: Option<Arc<Cable>>,
     input: Option<InputThread>,
     capture: Option<CaptureThread>,
+    /// Rare control messages from the capture thread (`Started`/`Warning`/`Stopped`).
+    /// Frames do **not** travel here — see `frames`.
     frame_rx: Option<Receiver<CaptureMsg>>,
+    /// The newest captured frame, exactly one of them. This is the bound that
+    /// stops a stalled UI from consuming the machine: see `FrameSlot`.
+    frames: Option<FrameSlot>,
     texture: Option<egui::TextureHandle>,
     last_frame: Option<crate::video::Frame>,
     video_label: String,
@@ -156,6 +161,7 @@ impl KvmControlPlusApp {
             input: None,
             capture: None,
             frame_rx: None,
+            frames: None,
             texture: None,
             last_frame: None,
             video_label: String::new(),
@@ -672,6 +678,13 @@ impl KvmControlPlusApp {
             .unwrap_or_default();
 
         let (tx, rx) = channel();
+        // Frames go into a single slot rather than down the channel: a channel is
+        // unbounded, and a UI that stops collecting — a minimised window is never
+        // painted on Windows — would then let frames pile up until the machine's
+        // memory was gone. That is what happened on 2026-10-11. The slot replaces
+        // the waiting frame instead, so a stalled UI costs one frame; see
+        // `FrameSlot`.
+        let frames = FrameSlot::new();
         // The capture thread wakes the UI when a frame arrives. Without this the
         // only way to notice a frame was to redraw continuously — which is what
         // the old unconditional `request_repaint` did, at the display's rate,
@@ -683,11 +696,13 @@ impl KvmControlPlusApp {
             self.settings.flip_vertical,
             tx,
             Box::new(move || wake_ctx.request_repaint()),
+            frames.clone(),
         ) {
             Ok(c) => {
                 log::info(format!("video started: {} [{}]", d.name, label));
                 self.capture = Some(c);
                 self.frame_rx = Some(rx);
+                self.frames = Some(frames);
                 self.video_error = None;
             }
             Err(e) => {
@@ -706,6 +721,7 @@ impl KvmControlPlusApp {
             }
         }
         self.frame_rx = None;
+        self.frames = None;
         self.texture = None;
         self.frames_this_second = 0;
         self.fps = 0.0;
@@ -804,12 +820,14 @@ impl KvmControlPlusApp {
     // ------------------------------------------------------------------
 
     fn pump_video(&mut self, ctx: &egui::Context) {
-        let mut newest: Option<crate::video::Frame> = None;
+        // Frames come from the single slot — bounded by construction, so at most
+        // one frame can be waiting however long this method goes uncalled. The
+        // channel carries only the rare control messages.
+        let newest = self.frames.as_ref().and_then(|f| f.take());
         let mut msgs = Vec::new();
         if let Some(rx) = &self.frame_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(CaptureMsg::Frame(f)) => newest = Some(f),
                     Ok(m) => msgs.push(m),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => break,
@@ -839,8 +857,8 @@ impl KvmControlPlusApp {
                     }
                     self.capture = None;
                     self.frame_rx = None;
+                    self.frames = None;
                 }
-                CaptureMsg::Frame(_) => {}
             }
         }
 
