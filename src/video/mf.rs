@@ -479,19 +479,8 @@ impl ColorInfo {
 /// unit test over known ramps is the only way to prove what this does.
 #[inline]
 pub fn yuv_to_rgb(y: u8, u: i32, v: i32, c: &ColorInfo) -> (u8, u8, u8) {
-    // (red-V, green-U, green-V, blue-U), ×256 fixed point.
-    let (cr, cg_u, cg_v, cb) = match (c.range, c.matrix) {
-        (ChromaRange::Limited, ColorMatrix::Bt601) => (409, 100, 208, 516),
-        (ChromaRange::Limited, ColorMatrix::Bt709) => (459, 55, 136, 541),
-        (ChromaRange::Full, ColorMatrix::Bt601) => (359, 88, 183, 454),
-        (ChromaRange::Full, ColorMatrix::Bt709) => (403, 48, 120, 475),
-    };
-    // Studio swing expands 16–235 to 0–255 (298/256 = 1.164); full range
-    // passes luma through untouched (256/256 = 1.0).
-    let base = match c.range {
-        ChromaRange::Limited => 298 * (y as i32 - 16),
-        ChromaRange::Full => 256 * y as i32,
-    };
+    let (cr, cg_u, cg_v, cb) = coefficients(c);
+    let base = luma_base(y, c);
     (
         clamp8((base + cr * v + 128) >> 8),
         clamp8((base - cg_u * u - cg_v * v + 128) >> 8),
@@ -499,8 +488,34 @@ pub fn yuv_to_rgb(y: u8, u: i32, v: i32, c: &ColorInfo) -> (u8, u8, u8) {
     )
 }
 
+/// `(red-V, green-U, green-V, blue-U)`, ×256 fixed point, for a range/matrix pair.
+///
+/// Shared with [`crate::picture`], which needs the same numbers *after* the
+/// user's curve has shaped the luma — one table, one place to get it right.
 #[inline]
-fn clamp8(v: i32) -> u8 {
+pub(crate) fn coefficients(c: &ColorInfo) -> (i32, i32, i32, i32) {
+    match (c.range, c.matrix) {
+        (ChromaRange::Limited, ColorMatrix::Bt601) => (409, 100, 208, 516),
+        (ChromaRange::Limited, ColorMatrix::Bt709) => (459, 55, 136, 541),
+        (ChromaRange::Full, ColorMatrix::Bt601) => (359, 88, 183, 454),
+        (ChromaRange::Full, ColorMatrix::Bt709) => (403, 48, 120, 475),
+    }
+}
+
+/// Luma in ×256 fixed point, before the chroma is added.
+///
+/// Studio swing expands 16–235 to 0–255 (298/256 = 1.164); full range passes
+/// luma through untouched (256/256 = 1.0).
+#[inline]
+pub(crate) fn luma_base(y: u8, c: &ColorInfo) -> i32 {
+    match c.range {
+        ChromaRange::Limited => 298 * (y as i32 - 16),
+        ChromaRange::Full => 256 * y as i32,
+    }
+}
+
+#[inline]
+pub(crate) fn clamp8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
@@ -521,6 +536,10 @@ pub struct Frame {
     /// is drawn *is* the pipeline latency, so it is carried rather than
     /// estimated — "the picture is behind" deserves a number, not a hunch.
     pub captured_at: std::time::Instant,
+    /// What the *source* luma plane looks like, measured during conversion.
+    /// "It looks washed out to me" becomes "the source uses 19…231", which is a
+    /// statement the app can act on.
+    pub stats: crate::picture::PictureStats,
 }
 
 impl Frame {
@@ -571,8 +590,10 @@ pub enum CaptureMsg {
         width: u32,
         height: u32,
         label: String,
-        /// How the arriving samples are being read, for the UI to show.
-        colour: String,
+        /// How the media type says the samples should be read, *before* any
+        /// override. Carried as the struct rather than as a sentence, so the UI
+        /// can show what the device says beside what the user chose.
+        colour: ColorInfo,
     },
     /// Non-fatal problem (e.g. a dropped sample).
     Warning(String),
@@ -596,6 +617,10 @@ impl CaptureThread {
     /// `frames` is the single-slot hand-off to the UI. The caller keeps a clone;
     /// **nothing here needs to read it** for frames to arrive (the `--snapshot` and
     /// `--soak` modes poll it directly).
+    ///
+    /// `adjust` is shared with the UI. It is read **once per frame** (not per
+    /// pixel), so moving a slider changes the picture on the next frame without
+    /// restarting the stream, and a frame can never mix two settings.
     pub fn start(
         symbolic_link: String,
         format_label: String,
@@ -603,6 +628,7 @@ impl CaptureThread {
         tx: Sender<CaptureMsg>,
         wake: Box<dyn Fn() + Send>,
         frames: FrameSlot,
+        adjust: Arc<Mutex<crate::picture::Adjust>>,
     ) -> Result<CaptureThread, String> {
         ensure_started()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -619,6 +645,7 @@ impl CaptureThread {
                     &stop_thread,
                     &wake,
                     &frames,
+                    &adjust,
                 ) {
                     let _ = tx.send(CaptureMsg::Stopped(e));
                     wake();
@@ -777,6 +804,7 @@ fn capture_loop(
     stop: &AtomicBool,
     wake: &(dyn Fn() + Send),
     frames: &FrameSlot,
+    adjust: &Mutex<crate::picture::Adjust>,
 ) -> Result<(), String> {
     let source = open_source(symbolic_link)?;
     let reader = create_reader(&source)?;
@@ -785,11 +813,21 @@ fn capture_loop(
     // The frame size lives on the *media type*, not on the samples, so it is
     // captured here and handed to every conversion.
     let (width, height, label, color) = configure_reader(&reader, symbolic_link, format_label)?;
+    // Say what the picture will be read as *and* what the user changed, on one
+    // line: that pair is the first thing to look at when a picture is wrong.
+    {
+        let chosen = adjust.lock().unwrap();
+        crate::logging::info(format!(
+            "picture: {} | adjustments: {}",
+            chosen.resolve(&color).describe(),
+            chosen.describe()
+        ));
+    }
     let _ = tx.send(CaptureMsg::Started {
         width,
         height,
         label,
-        colour: color.describe(),
+        colour: color,
     });
 
     let mut cb = CaptureBuffers::new();
@@ -884,13 +922,20 @@ fn capture_loop(
         // and understating it would defeat the measurement.
         let captured_at = Instant::now();
 
+        // The user's adjustments, resolved once for this frame: one lock per
+        // frame (never per pixel), and no frame can mix two settings.
+        let curve = {
+            let chosen = adjust.lock().unwrap();
+            crate::picture::Curve::build(&chosen, &color)
+        };
+
         match convert_sample(
             &sample,
             &mut cb,
             flip_vertical,
             width,
             height,
-            &color,
+            &curve,
             captured_at,
         ) {
             Ok(frame) => {
@@ -1006,17 +1051,17 @@ impl CaptureBuffers {
 
 /// Lock the sample's buffer and convert NV12 → packed RGB8.
 ///
-/// The range and matrix come from `color`, which was read off the media type
-/// the decoder actually produced rather than assumed — that is the difference
-/// between a correct picture and one whose contrast is stretched and whose
-/// highlights are clipped flat.
+/// The range and matrix come from the frame's [`crate::picture::Curve`], which
+/// starts from what the decoder actually produced and then applies whatever the
+/// user changed by hand — that is the difference between a correct picture and
+/// one whose contrast is stretched and whose highlights are clipped flat.
 fn convert_sample(
     sample: &IMFSample,
     cb: &mut CaptureBuffers,
     flip_vertical: bool,
     width: u32,
     height: u32,
-    color: &ColorInfo,
+    curve: &crate::picture::Curve,
     captured_at: std::time::Instant,
 ) -> Result<Frame, String> {
     unsafe {
@@ -1036,9 +1081,11 @@ fn convert_sample(
         // zeros — explains a black picture far faster than staring at a window.
         let current = buffer.GetCurrentLength().unwrap_or(0);
         // NV12 rows are `pitch` bytes apart, and the UV plane's rows match.
-        let pitch = color.y_stride.max(width as usize);
+        let pitch = curve.color.y_stride.max(width as usize);
         let luma_bytes = pitch * height as usize;
-        {
+        // Measured here and carried on the frame: the UI shows it, so a range
+        // that is being read wrongly is visible as numbers, not as an opinion.
+        let stats = {
             let probe = std::slice::from_raw_parts(ptr, max_len as usize);
             let brightest = probe.iter().copied().max().unwrap_or(0);
             let sum: u64 = probe.iter().map(|&b| b as u64).sum();
@@ -1063,11 +1110,26 @@ fn convert_sample(
             } else {
                 uv_slice.iter().map(|&b| b as u64).sum::<u64>() as f64 / uv_slice.len() as f64
             };
+            // Where the luma actually sits, as percentages of the plane — the
+            // measurement that separates "the picture is dark" from "the picture
+            // never reaches black or white at all".
+            let y_len = y_slice.len().max(1) as f64;
+            let near_black = y_slice.iter().filter(|&&b| b <= 16).count() as f64;
+            let near_white = y_slice.iter().filter(|&&b| b >= 235).count() as f64;
+            let measured = crate::picture::PictureStats {
+                y_min,
+                y_max,
+                y_mean: y_mean as f32,
+                near_black_pct: (near_black / y_len * 100.0) as f32,
+                near_white_pct: (near_white / y_len * 100.0) as f32,
+            };
             crate::logging::trace(format!(
-                "frame {width}x{height} buffer current={current} max={max_len} brightest={brightest} mean={mean:.2} | Y min={y_min} max={y_max} mean={y_mean:.2} | U/V mean={uv_mean:.2} | {}",
-                color.describe()
+                "frame {width}x{height} buffer current={current} max={max_len} brightest={brightest} mean={mean:.2} | Y min={y_min} max={y_max} mean={y_mean:.2} | U/V mean={uv_mean:.2} | {} | {}",
+                curve.color.describe(),
+                measured.describe()
             ));
-        }
+            measured
+        };
 
         let result = (|| {
             let (w, h) = (width, height);
@@ -1109,7 +1171,8 @@ fn convert_sample(
 
                     let mut dx = 0usize;
                     while dx < 2 && x + dx < w as usize {
-                        let (r, g, b) = yuv_to_rgb(src[lum_row + x + dx], u, v, color);
+                        let (r, g, b) =
+                            crate::picture::convert_pixel(src[lum_row + x + dx], u, v, curve);
                         let d = dst_row + (x + dx) * 3;
                         cb.rgb[d] = r;
                         cb.rgb[d + 1] = g;
@@ -1117,9 +1180,9 @@ fn convert_sample(
 
                         if y == 0 && x + dx == 0 {
                             crate::logging::trace(format!(
-                                "px0 luma_idx={} u={u} v={v} -> r={r} g={g} b={b} | {}",
-                                lum_row,
-                                color.describe()
+                                "px0 y={} u={u} v={v} -> r={r} g={g} b={b} | {}",
+                                src[lum_row + x + dx],
+                                curve.color.describe()
                             ));
                         }
                         dx += 1;
@@ -1147,6 +1210,7 @@ fn convert_sample(
                 rgb: std::mem::take(&mut cb.rgb),
                 flipped: flip_vertical,
                 captured_at,
+                stats,
             })
         })();
 
@@ -1425,6 +1489,7 @@ mod tests {
             rgb: Vec::new(),
             flipped: false,
             captured_at: Instant::now(),
+            stats: Default::default(),
         }
     }
 

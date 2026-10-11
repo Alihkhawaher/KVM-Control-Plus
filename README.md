@@ -45,6 +45,40 @@ contrast by ~16% and clips every luma level from 235 upward to flat white — 8%
 the tonal range, and a picture that looks washed out and too bright. The decision
 and its reason appear in the log and in the **LINK & FORMATS** panel.
 
+### When the device is wrong: the picture knobs
+
+The media type is the best answer available, and it is still an answer that can be
+wrong — a cheap dongle can hand over studio-swing video inside a format that claims
+full range, and nothing in the stream contradicts it. So the decode is not the last
+word. The **Options** tab has a **PICTURE** section that overrides **source range**
+(auto / full 0–255 / limited 16–235) and **matrix** (auto / BT.601 / BT.709), and
+adjusts **brightness**, **contrast**, **saturation** and **gamma**. Everything
+applies live: the settings are resolved once per frame, so no frame can be half one
+setting and half another. At neutral the maths is bit-exact with the unadjusted
+decode, so a user who changes nothing sees exactly the picture they saw before the
+knobs existed. The choices are remembered in `settings.conf` under `[picture]`.
+
+Which way to move them is measured, not guessed. The luma plane is already being
+walked for the 4:2:0 chroma, so the minimum, maximum, mean and the share of pixels
+at or below 16 / at or above 235 come out of that same pass, and the window prints
+them next to the picture:
+
+```
+Source luma   source luma 2…254 (mean 118); 0.3% at or below 16, 61.2% at or above 235
+```
+
+A source that never goes below ~16 or above ~235 is the washed-out signature, and
+the panel says so and names the fix. A source that reaches both ends is telling you
+the transfer function is right, and that what you are looking at is the compression
+and the scaling of a 1080p frame into a smaller pane — no range override helps with
+that, and the panel says that too.
+
+The same knobs exist headlessly, so two decodes can be compared without the GUI:
+
+```
+KVM-Control-Plus.exe --picture range=limited,contrast=1.2,gamma=1.4 --snapshot out/b.bmp
+```
+
 **Latency is measured, not guessed.** Every frame carries the instant it was
 sampled, and the window shows `N ms now / N ms worst — N fps` (also overlaid on
 the video and logged once a second). Capture requests `MF_LOW_LATENCY`, the UI

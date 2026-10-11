@@ -6,7 +6,7 @@
 //!   3. the `panel_*` methods  — one per screen area
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, RichText};
 
@@ -17,8 +17,11 @@ use crate::kvm::layout;
 use crate::kvm::serial_scan::{self, SerialPortInfo};
 use crate::kvm::{ch9329, keymap};
 use crate::logging::{self as log, Level};
+use crate::picture::{Adjust, MatrixOverride, PictureStats, RangeOverride};
 use crate::ui::{self, Palette};
-use crate::video::mf::{self, CaptureMsg, CaptureThread, FrameSlot, VideoDevice, VideoFormat};
+use crate::video::mf::{
+    self, CaptureMsg, CaptureThread, ColorInfo, FrameSlot, VideoDevice, VideoFormat,
+};
 
 /// Which controls the left panel is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,10 +89,23 @@ pub struct KvmControlPlusApp {
     last_frame: Option<crate::video::Frame>,
     video_label: String,
     video_error: Option<String>,
-    /// How the arriving samples are being interpreted (range + matrix), as
-    /// reported by the capture thread. Shown so a wrong-looking picture can be
+    /// How the arriving samples are being interpreted (range + matrix), *with the
+    /// user's overrides folded in*. Shown so a wrong-looking picture can be
     /// diagnosed from the window instead of from the source.
     video_colour: String,
+    /// What the *media type* itself said, before any override — kept so the
+    /// report can put "the device says this" beside "you chose that".
+    media_colour: Option<ColorInfo>,
+    /// The picture adjustments, shared with the capture thread: it reads them
+    /// once per frame, this side edits them. One `Mutex`, so there is only ever
+    /// one copy of the truth.
+    picture: Arc<Mutex<Adjust>>,
+    /// Luma statistics of the newest frame's **source** plane. This is what turns
+    /// "it looks washed out" into "it uses 19…231".
+    picture_stats: Option<PictureStats>,
+    /// The last adjustment description that was logged, so dragging a slider
+    /// writes one line per change rather than one per frame.
+    picture_logged: String,
     /// Real measured USB link for the selected capture device, if we could get
     /// one. `None` + a note means "could not measure", never "assumed fine".
     usb_link: Option<crate::video::usb_link::UsbLink>,
@@ -167,6 +183,10 @@ impl KvmControlPlusApp {
             video_label: String::new(),
             video_error: None,
             video_colour: String::new(),
+            media_colour: None,
+            picture: Arc::new(Mutex::new(settings.picture())),
+            picture_stats: None,
+            picture_logged: String::new(),
             usb_link: None,
             usb_link_note: None,
             frames_this_second: 0,
@@ -377,6 +397,24 @@ impl KvmControlPlusApp {
         // it behind" — both belong in the window, not in a debug session.
         if !self.video_colour.is_empty() {
             ui::kv(ui, &p, "Colour", &self.video_colour, None);
+        }
+        if let (Some(media), true) = (
+            self.media_colour.as_ref(),
+            self.picture.lock().unwrap().overrides_the_media_type(),
+        ) {
+            ui::kv(ui, &p, "Media type says", &media.describe(), None);
+        }
+        if let Some(stats) = &self.picture_stats {
+            ui::kv(ui, &p, "Source luma", &stats.describe(), None);
+            let (color, text) = if stats.looks_limited_range() {
+                (
+                    p.warn,
+                    "Washed out: the source never reaches black or white.",
+                )
+            } else {
+                (p.dim, stats.verdict())
+            };
+            ui.label(RichText::new(text).color(color).size(11.5));
         }
         if self.capture.is_some() {
             let latency_color = if self.latency_ms > 120.0 {
@@ -697,6 +735,7 @@ impl KvmControlPlusApp {
             tx,
             Box::new(move || wake_ctx.request_repaint()),
             frames.clone(),
+            self.picture.clone(),
         ) {
             Ok(c) => {
                 log::info(format!("video started: {} [{}]", d.name, label));
@@ -843,10 +882,13 @@ impl KvmControlPlusApp {
                     colour,
                 } => {
                     self.video_label = format!("{width}x{height} {label}");
-                    self.video_colour = colour;
+                    self.media_colour = Some(colour);
+                    self.refresh_colour_line();
                     log::info(format!(
-                        "stream live at {} — colour: {}",
-                        self.video_label, self.video_colour
+                        "stream live at {} — colour: {} | adjustments: {}",
+                        self.video_label,
+                        self.video_colour,
+                        self.picture.lock().unwrap().describe()
                     ));
                 }
                 CaptureMsg::Warning(w) => log::warn(w),
@@ -863,6 +905,10 @@ impl KvmControlPlusApp {
         }
 
         if let Some(frame) = newest {
+            // The source's own statistics, carried on the frame: measured where
+            // the pixels were already being walked, and the only honest way to
+            // answer "why does it look like that".
+            self.picture_stats = Some(frame.stats);
             // How long the newest frame had been waiting before it was drawn.
             // That age *is* the pipeline latency, and measuring it is the only
             // way to tell whether a change to the capture path actually helped.
@@ -1519,6 +1565,128 @@ impl KvmControlPlusApp {
             self.save_screenshot();
         }
 
+        ui::section(ui, &p, "PICTURE");
+        ui.label(
+            RichText::new(
+                "The device's own answer is the best guess, not a guarantee: a dongle can hand \
+                 over limited-range video (16-235) inside a format that claims full range, and \
+                 that looks washed out — no true black, no true white. These override it, live.",
+            )
+            .color(p.dim)
+            .size(11.5),
+        );
+
+        // One lock for the whole section: the widgets all edit the same struct,
+        // and the capture thread cannot see a half-edited value mid-draw.
+        let mut adjust = *self.picture.lock().unwrap();
+        let mut changed = false;
+        let mut save_now = false;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Source range").size(12.0));
+            for option in [
+                RangeOverride::Auto,
+                RangeOverride::Full,
+                RangeOverride::Limited,
+            ] {
+                if ui
+                    .selectable_label(adjust.range == option, option.label())
+                    .clicked()
+                {
+                    adjust.range = option;
+                    changed = true;
+                    save_now = true;
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Matrix").size(12.0));
+            for option in [
+                MatrixOverride::Auto,
+                MatrixOverride::Bt601,
+                MatrixOverride::Bt709,
+            ] {
+                if ui
+                    .selectable_label(adjust.matrix == option, option.label())
+                    .clicked()
+                {
+                    adjust.matrix = option;
+                    changed = true;
+                    save_now = true;
+                }
+            }
+        });
+
+        // The sliders: `changed` fires on every frame of a drag, so the file is
+        // written when the drag ends rather than 60 times a second.
+        //
+        // `slider_width` is set here because egui squeezes the rail to about 45 px
+        // in this narrow pane, which is too small a target to drag with any
+        // precision — seen on screen, not guessed at.
+        ui.spacing_mut().slider_width = 160.0;
+        for (value, range, label) in [
+            (&mut adjust.brightness, -1.0..=1.0, "brightness"),
+            (&mut adjust.contrast, 0.25..=3.0, "contrast"),
+            (&mut adjust.saturation, 0.0..=2.0, "saturation"),
+            (&mut adjust.gamma, 0.4..=2.5, "gamma"),
+        ] {
+            let r = ui.add(egui::Slider::new(value, range).text(label));
+            changed |= r.changed();
+            save_now |= r.drag_stopped();
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            // Disabled when there is nothing to reset: that also answers "is any
+            // of this doing anything right now?" without reading the description.
+            let neutral = adjust.is_neutral();
+            let button = egui::Button::new("Reset to neutral");
+            if ui.add_enabled(!neutral, button).clicked() {
+                adjust = Adjust::default();
+                changed = true;
+                save_now = true;
+            }
+            ui.label(RichText::new(adjust.describe()).color(p.dim).size(11.5));
+        });
+
+        // What the source is doing, right here: this is the measurement that says
+        // whether the range is being read wrongly, and it is worth nothing if it
+        // is hidden in another tab.
+        if let Some(stats) = &self.picture_stats {
+            ui::kv(ui, &p, "Source luma", &stats.describe(), None);
+            let (color, text) = if stats.looks_limited_range() {
+                (
+                    p.warn,
+                    "This is the washed-out signature — try Source range \"limited 16-235\".",
+                )
+            } else {
+                (p.dim, stats.verdict())
+            };
+            ui.label(RichText::new(text).color(color).size(11.5));
+        } else if self.capture.is_some() {
+            ui.label(
+                RichText::new("waiting for a frame to measure…")
+                    .color(p.dim)
+                    .size(11.5),
+            );
+        }
+
+        if changed {
+            *self.picture.lock().unwrap() = adjust;
+            self.refresh_colour_line();
+            self.settings.set_picture(&adjust);
+            let described = adjust.describe();
+            if described != self.picture_logged {
+                self.picture_logged = described.clone();
+                log::info(format!("picture adjustments: {described}"));
+            }
+        }
+        if save_now {
+            match self.settings.save() {
+                Ok(()) => log::debug("picture adjustments saved"),
+                Err(e) => log::warn(format!("could not save picture adjustments: {e}")),
+            }
+        }
+
         ui::section(ui, &p, "LOGGING");
         ui.label(
             RichText::new("Logging is always on — this only changes what the panel shows.")
@@ -1677,6 +1845,19 @@ impl KvmControlPlusApp {
         } else {
             parts.join("  |  ")
         }
+    }
+
+    /// Recompute the one-line colour description: what the media type said, with
+    /// the user's overrides folded in, so the window always shows what is *in
+    /// force* rather than what the device merely claimed.
+    fn refresh_colour_line(&mut self) {
+        let chosen = *self.picture.lock().unwrap();
+        self.video_colour = match &self.media_colour {
+            Some(media) => chosen.resolve(media).describe(),
+            // Nothing capturing yet: better an empty row than a claim about a
+            // stream that does not exist.
+            None => String::new(),
+        };
     }
 
     fn layout_info(&self) -> layout::LayoutInfo {

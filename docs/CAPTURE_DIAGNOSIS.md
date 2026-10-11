@@ -280,3 +280,46 @@ instant; the UI reports `N ms now / N ms worst — N fps` and logs a per-second
 summary. Capture requests `MF_LOW_LATENCY` (never requested before), the UI is
 woken by the capture thread instead of redrawing at the display's refresh rate,
 and chroma is read once per 4:2:0 pair instead of per pixel.
+
+---
+
+## 8. "It looks washed out" — what the pixels actually said
+
+The report came with a screenshot of the running app with a live picture in it. That
+is evidence, so it was measured rather than eyeballed: the PNG's scanlines were
+decoded in Python (no image library, no vision model) and sampled inside the video
+area only — the window title bar and the app's own status overlay are not part of the
+picture and would have supplied the "true black" for free.
+
+| Sample (inside the video area) | Measured | Reading |
+| --- | --- | --- |
+| "Chats" heading glyphs | **min 2, 1st percentile 11** | the picture *does* reach true black |
+| list/body text | 1% ≈ 101, 5% ≈ 183 | greys where the source's own greys are |
+| background | **254** | true white |
+| a saturated element | `rgb(0,166,255)` | chroma intact, not muted |
+
+So on this stream — **MJPG at 1920x1080** — the transfer function is already right:
+black is black and white is white. The generalised "washed out" explanation
+(limited-range content decoded as full range: nothing below ~6% grey, nothing above
+~92%) does **not** hold here, and making a range override the default would have made
+this picture worse, not better.
+
+What the picture does have: a 1920 px frame shown in a ~1295 px pane — **0.67×** —
+decoded from **MJPEG**. Text is soft compared with the same text on the real monitor,
+and softness reads as "washed out" to the eye while the numbers say the levels are
+fine. Two candidate improvements were considered and rejected as the *fix*: mipmapped
+minification (epaint honours `mipmap_mode` only on the glow backend, and mipmaps
+smooth rather than sharpen) and a nearest-neighbour switch (worse below 1:1).
+
+What the app does about it instead:
+
+1. **The knobs exist anyway** — `Options → PICTURE`: range and matrix overrides for the
+   day a dongle really is wrong, plus brightness / contrast / saturation / gamma for
+   taste. Neutral is bit-exact with the untouched decode.
+2. **The measurement is on screen**, from the luma pass that already runs for chroma:
+   `Source luma source luma 2…254 (mean 118); 0.3% at or below 16, 61.2% at or above 235`.
+   A source that never goes below ~16 or above ~235 is the washed-out signature and the
+   panel names the fix; one that reaches both ends is told the transfer function is
+   right and that scaling and compression are what remain.
+3. **`--picture <spec>`** gives the same knobs headlessly, so an adjustment can be
+   A/B'd against the untouched decode instead of argued about.

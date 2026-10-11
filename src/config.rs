@@ -62,6 +62,17 @@ pub struct Settings {
     /// pane the full width of the window; the top-bar toggle brings it back.
     pub show_left_pane: bool,
 
+    /// Picture adjustments (see `crate::picture`): how the incoming video is
+    /// read, and the four knobs on top of it. Stored as short strings/floats so
+    /// the file stays hand-editable; neutral defaults mean an untouched install
+    /// decodes exactly what the media type says.
+    pub pic_range: String,
+    pub pic_matrix: String,
+    pub pic_brightness: f32,
+    pub pic_contrast: f32,
+    pub pic_saturation: f32,
+    pub pic_gamma: f32,
+
     /// Keys we did not recognise, kept verbatim so nothing is lost on save.
     pub unknown: BTreeMap<String, String>,
 }
@@ -94,6 +105,12 @@ impl Default for Settings {
             theme: "dark".into(),
             log_level: "info".into(),
             show_left_pane: true,
+            pic_range: "auto".into(),
+            pic_matrix: "auto".into(),
+            pic_brightness: 0.0,
+            pic_contrast: 1.0,
+            pic_saturation: 1.0,
+            pic_gamma: 1.0,
             unknown: BTreeMap::new(),
         }
     }
@@ -185,6 +202,30 @@ impl Settings {
         kv(&mut out, "theme", &self.theme);
         kv(&mut out, "log_level", &self.log_level);
         kv(&mut out, "show_left_pane", &self.show_left_pane.to_string());
+        // Keys are prefixed because the parser is flat — sections are decoration.
+        out.push_str("\n[picture]\n");
+        out.push_str("# How the incoming video is read. 'auto' believes the capture\n");
+        out.push_str("# device; 'limited' (16-235) is what fixes a washed-out picture from\n");
+        out.push_str("# a dongle whose JPEG claims full range but is not.\n");
+        kv(&mut out, "pic_range", &self.pic_range);
+        kv(&mut out, "pic_matrix", &self.pic_matrix);
+        out.push_str("# Adjustments, neutral at 0.0 / 1.0 / 1.0 / 1.0.\n");
+        kv(
+            &mut out,
+            "pic_brightness",
+            &format!("{:.3}", self.pic_brightness),
+        );
+        kv(
+            &mut out,
+            "pic_contrast",
+            &format!("{:.3}", self.pic_contrast),
+        );
+        kv(
+            &mut out,
+            "pic_saturation",
+            &format!("{:.3}", self.pic_saturation),
+        );
+        kv(&mut out, "pic_gamma", &format!("{:.3}", self.pic_gamma));
         for (k, v) in &self.unknown {
             kv(&mut out, k, v);
         }
@@ -226,6 +267,12 @@ impl Settings {
                 "theme" => s.theme = v,
                 "log_level" => s.log_level = v,
                 "show_left_pane" => s.show_left_pane = parse_bool(&v),
+                "pic_range" => s.pic_range = v,
+                "pic_matrix" => s.pic_matrix = v,
+                "pic_brightness" => s.pic_brightness = v.parse().unwrap_or(s.pic_brightness),
+                "pic_contrast" => s.pic_contrast = v.parse().unwrap_or(s.pic_contrast),
+                "pic_saturation" => s.pic_saturation = v.parse().unwrap_or(s.pic_saturation),
+                "pic_gamma" => s.pic_gamma = v.parse().unwrap_or(s.pic_gamma),
                 other => {
                     s.unknown.insert(other.to_string(), v);
                 }
@@ -233,12 +280,44 @@ impl Settings {
         }
         s
     }
+
+    /// The picture adjustments, as stored.
+    ///
+    /// Lenient in the same way the rest of the file is: an unparseable value
+    /// falls back to neutral rather than reaching the pixel maths, and a
+    /// hand-edited file cannot put a NaN where a gamma belongs.
+    pub fn picture(&self) -> crate::picture::Adjust {
+        let mut a = crate::picture::Adjust::default();
+        a.range = crate::picture::Adjust::parse_range(&self.pic_range, a.range);
+        a.matrix = crate::picture::Adjust::parse_matrix(&self.pic_matrix, a.matrix);
+        let knob = |value: f32, fallback: f32, lo: f32, hi: f32| {
+            if value.is_finite() {
+                value.clamp(lo, hi)
+            } else {
+                fallback
+            }
+        };
+        a.brightness = knob(self.pic_brightness, 0.0, -1.0, 1.0);
+        a.contrast = knob(self.pic_contrast, 1.0, 0.25, 3.0);
+        a.saturation = knob(self.pic_saturation, 1.0, 0.0, 2.0);
+        a.gamma = knob(self.pic_gamma, 1.0, 0.4, 2.5);
+        a
+    }
+
+    /// Store the adjustments back into the settings (the caller saves).
+    pub fn set_picture(&mut self, a: &crate::picture::Adjust) {
+        self.pic_range = a.range_key().to_string();
+        self.pic_matrix = a.matrix_key().to_string();
+        self.pic_brightness = a.brightness;
+        self.pic_contrast = a.contrast;
+        self.pic_saturation = a.saturation;
+        self.pic_gamma = a.gamma;
+    }
 }
 
 fn kv(out: &mut String, key: &str, value: &str) {
     out.push_str(&format!("{key} = {value}\n"));
 }
-
 fn parse_bool(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
@@ -284,6 +363,40 @@ mod tests {
     fn clamps_absurd_mouse_speed() {
         assert_eq!(Settings::from_text("mouse_speed = 9999").mouse_speed, 10.0);
         assert_eq!(Settings::from_text("mouse_speed = 0").mouse_speed, 0.1);
+    }
+
+    #[test]
+    fn picture_adjustments_survive_a_round_trip() {
+        let mut s = Settings::default();
+        s.set_picture(&crate::picture::Adjust {
+            range: crate::picture::RangeOverride::Limited,
+            matrix: crate::picture::MatrixOverride::Bt601,
+            brightness: -0.25,
+            contrast: 1.4,
+            saturation: 0.9,
+            gamma: 1.6,
+        });
+        let restored = Settings::from_text(&s.to_text()).picture();
+        assert_eq!(restored.range, crate::picture::RangeOverride::Limited);
+        assert_eq!(restored.matrix, crate::picture::MatrixOverride::Bt601);
+        assert!((restored.brightness + 0.25).abs() < 1e-3);
+        assert!((restored.contrast - 1.4).abs() < 1e-3);
+        assert!((restored.saturation - 0.9).abs() < 1e-3);
+        assert!((restored.gamma - 1.6).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_neutral_picture_is_the_default_and_garbage_cannot_move_it() {
+        assert!(Settings::default().picture().is_neutral());
+
+        // A hand-edited file must not be able to feed the maths a NaN or an
+        // absurd value: these fall back or clamp, they do not pass through.
+        let a = Settings::from_text("pic_range = nonsense\npic_matrix = 300\npic_gamma = NaN\npic_contrast = -99\npic_brightness = 42\n").picture();
+        assert_eq!(a.range, crate::picture::RangeOverride::Auto);
+        assert_eq!(a.matrix, crate::picture::MatrixOverride::Auto);
+        assert_eq!(a.gamma, 1.0, "NaN must not reach the maths");
+        assert_eq!(a.contrast, 0.25);
+        assert_eq!(a.brightness, 1.0);
     }
 
     #[test]

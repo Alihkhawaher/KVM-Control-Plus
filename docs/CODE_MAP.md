@@ -40,6 +40,14 @@ KVM-Control Plus/
    ├─ logging.rs     Ring-buffer logger + Level. Feeds stdout, the GUI log panel,
    │                 and (for GUI runs) `last-run.log` — a fatal message from the
    │                 runtime itself must not vanish with the console again.
+   ├─ picture.rs     The user's knobs on the decode: `Adjust` (range override, matrix
+   │                 override, brightness, contrast, saturation, gamma), the `Curve`
+   │                 resolved from them once per frame, `convert_pixel` (the one call in
+   │                 the hot loop), and `PictureStats`, which measures the source's luma
+   │                 min/max/mean and how much of it sits at or below 16 / at or above 235.
+   │                 Pure functions and no device, so the colour maths is unit-testable —
+   │                 including the test that neutral settings are bit-exact with the
+   │                 original conversion. No new dependency.
    ├─ proc_mem.rs    `GetProcessMemoryInfo`, and the ceiling on this app's commit.
    │                 Named `over_ceiling`, checked once a second by the capture
    │                 loop: a bug may damage this app, never the machine it runs on.
@@ -101,10 +109,15 @@ keyboard/mouse ──► input/hook.rs ──► InputEvent ──► app.rs ─
                                                             CH9329 ──► USB ──► remote PC
 
 MS2130 dongle ──► video/mf.rs (source reader, NV12) ──► NV12→RGB ──► FrameSlot ──► egui
-                        │                                     (holds ONE frame, newest
-                        │                                      wins — a stalled UI
-                        │                                      costs one frame, not
-                        │                                      the machine's memory)
+                        │                            ▲         (holds ONE frame, newest
+                        │                            │          wins — a stalled UI
+                        │                            │          costs one frame, not
+                        │                            │          the machine's memory)
+                        │                            └── picture.rs: the range and matrix
+                        │                                the user chose, plus brightness,
+                        │                                contrast, saturation and gamma —
+                        │                                resolved once per frame, never
+                        │                                per pixel
                         └── video/usb_link.rs (how fast is this link, really?)
 ```
 

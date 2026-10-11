@@ -17,6 +17,7 @@ mod config;
 mod input;
 mod kvm;
 mod logging;
+mod picture;
 mod proc_mem;
 mod ui;
 mod video;
@@ -113,6 +114,20 @@ fn main() -> eframe::Result<()> {
             }
         }
         return Ok(());
+    }
+
+    // ---- picture adjustments, for every mode that captures ----------------
+    // The same knobs the GUI has, from a terminal: an adjustment can then be
+    // tested (and A/B'd against the untouched picture) without the window, which
+    // is the only way to see what "range=limited" actually did to a real frame.
+    if let Some(i) = args.iter().position(|a| a == "--picture") {
+        if let Some(spec) = args.get(i + 1) {
+            let parsed = parse_picture_spec(spec);
+            crate::logging::info(format!("--picture {spec} => {}", parsed.describe()));
+            let _ = PICTURE.set(parsed);
+        } else {
+            eprintln!("--picture needs a spec, e.g. --picture range=limited,gamma=1.4");
+        }
     }
 
     if args.iter().any(|a| a == "--list-ports") {
@@ -348,6 +363,7 @@ fn main() -> eframe::Result<()> {
             // No UI to wake: this mode polls the slot itself.
             Box::new(|| {}),
             frames.clone(),
+            picture_handle(),
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -371,7 +387,10 @@ fn main() -> eframe::Result<()> {
                     label,
                     colour,
                 }) => {
-                    println!("  stream live at {width}x{height} {label} — colour: {colour}");
+                    println!(
+                        "  stream live at {width}x{height} {label} — colour: {}",
+                        colour.describe()
+                    );
                 }
                 Ok(video::CaptureMsg::Warning(w)) => eprintln!("  warn: {w}"),
                 Ok(video::CaptureMsg::Stopped(e)) => {
@@ -541,6 +560,50 @@ fn start_run_log() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// `--picture` as parsed at startup.
+///
+/// A `OnceLock` rather than a parameter threaded through seven modes: it is set
+/// once, before any capture begins, and never changes afterwards.
+static PICTURE: std::sync::OnceLock<picture::Adjust> = std::sync::OnceLock::new();
+
+/// The adjustments a capture mode hands to the capture thread. Each mode gets
+/// its own handle; the CLI has no UI to share one with.
+fn picture_handle() -> std::sync::Arc<std::sync::Mutex<picture::Adjust>> {
+    std::sync::Arc::new(std::sync::Mutex::new(
+        PICTURE.get().copied().unwrap_or_default(),
+    ))
+}
+
+/// `--picture range=limited,contrast=1.2,gamma=1.4` — the GUI's knobs as text.
+///
+/// Lenient on purpose: an unrecognised key is reported and skipped rather than
+/// being fatal, and an unparseable *value* keeps the default. A typo should cost
+/// a line of output, not a run.
+fn parse_picture_spec(spec: &str) -> picture::Adjust {
+    let mut a = picture::Adjust::default();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = part.split_once('=') else {
+            eprintln!("--picture: {part:?} is not key=value; ignoring");
+            continue;
+        };
+        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+        match key.as_str() {
+            "range" => a.range = picture::Adjust::parse_range(value, a.range),
+            "matrix" => a.matrix = picture::Adjust::parse_matrix(value, a.matrix),
+            "brightness" => a.brightness = value.parse().unwrap_or(a.brightness),
+            "contrast" => a.contrast = value.parse().unwrap_or(a.contrast),
+            "saturation" => a.saturation = value.parse().unwrap_or(a.saturation),
+            "gamma" => a.gamma = value.parse().unwrap_or(a.gamma),
+            other => eprintln!("--picture: unknown setting {other:?}; ignoring"),
+        }
+    }
+    a
+}
+
 /// Resolve a capture device by index, by name, or to the first one available.
 fn pick_device(which: &str) -> Option<video::mf::VideoDevice> {
     let devices = video::mf::list_devices().ok()?;
@@ -596,6 +659,7 @@ fn soak(which: &str, secs: u64) -> eframe::Result<()> {
         // Nobody collects: that is the entire point of this mode.
         Box::new(|| {}),
         frames.clone(),
+        picture_handle(),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -688,6 +752,9 @@ DIAGNOSTICS:
     --raw-probe [DEVICE]        walk the native formats, report which ones stream
     --soak <seconds> [DEVICE]   run capture with nobody collecting, and measure
                                 that the frame path cannot grow without bound
+    --picture <spec>            picture tweaks in any capture mode, e.g.
+                                range=limited,contrast=1.2,gamma=1.4 (also in
+                                the GUI's Options tab, with sliders)
 
 LOGGING:
     -q, --quiet                 warnings and errors only

@@ -4,7 +4,7 @@ Living document. Updated as work lands. `[x]` = done and verified on real
 hardware, `[~]` = coded but not yet exercised against a live source, `[ ]` = not
 started.
 
-Last updated: round 6 (bounded frame path — fixes the 2026-10-11 out-of-memory crash).
+Last updated: round 7 (the picture became adjustable — the answer to "it looks washed out").
 
 ---
 
@@ -14,7 +14,7 @@ A Rust rewrite of the C#/WinUI3 `Control3` (laptop-as-KVM: MS2130 capture dongle
 + CH9329 serial HID bridge). The whole app is **two direct dependencies** —
 `eframe` (GUI) and `windows` (all platform plumbing). Nothing else.
 
-Current state: **builds clean, 0 warnings, 58/58 tests pass**, and the full path
+Current state: **builds clean, 0 warnings, 80/80 tests pass**, and the full path
 has been exercised against the real Hagibis MS2130 dongle on this machine.
 
 ---
@@ -108,6 +108,19 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
 - [x] **`--soak <seconds>` — the regression harness.** Runs capture with nobody
       collecting and prints committed memory, so "this cannot happen again" is a
       measurement: 61 frames, 0 collected, memory flat at 9.9 MB.
+- [x] **The picture is adjustable — the answer to "it looks washed out".** `src/picture.rs`
+      (no new dependency) resolves the range and matrix the *user* chose on top of what
+      the media type claimed, plus brightness / contrast / saturation / gamma, **once per
+      frame** — so no frame can be half one setting and half another. In the GUI:
+      `Options → PICTURE`; headlessly: `--picture range=limited,contrast=1.2,gamma=1.4`.
+      Neutral is bit-exact with the old conversion (a test asserts `1192/256` stays
+      `1192/256`), so changing nothing changes nothing. The luma walk that already runs
+      for 4:2:0 now also reports `min…max`, mean, and the share of pixels at or below 16 /
+      at or above 235 — "washed out" is answered with numbers, and the panel says which
+      knob to reach for. Measured on a screenshot of the live picture: glyphs at luma 2,
+      background 254, `rgb(0,166,255)` intact — the range was already right on this
+      stream, and the softness of a 0.67× MJPEG view is what the eye calls washed out.
+      `docs/CAPTURE_DIAGNOSIS.md` §8.
 - [x] **CLI verification modes** — `--version`, `--list-ports`, `--list-devices`,
       `--list-formats N`, `--probe`, `--usb`, `--snapshot`, `--raw-probe`,
       `--grab-native`. These are how the capture problem was diagnosed.
