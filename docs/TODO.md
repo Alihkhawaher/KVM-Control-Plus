@@ -4,7 +4,7 @@ Living document. Updated as work lands. `[x]` = done and verified on real
 hardware, `[~]` = coded but not yet exercised against a live source, `[ ]` = not
 started.
 
-Last updated: round 7 (the picture became adjustable — the answer to "it looks washed out").
+Last updated: round 8 (a cable plugged in backwards is named, not reported as "0 ports").
 
 ---
 
@@ -14,7 +14,7 @@ A Rust rewrite of the C#/WinUI3 `Control3` (laptop-as-KVM: MS2130 capture dongle
 + CH9329 serial HID bridge). The whole app is **two direct dependencies** —
 `eframe` (GUI) and `windows` (all platform plumbing). Nothing else.
 
-Current state: **builds clean, 0 warnings, 80/80 tests pass**, and the full path
+Current state: **builds clean, 0 warnings, 85/85 tests pass**, and the full path
 has been exercised against the real Hagibis MS2130 dongle on this machine.
 
 ---
@@ -34,6 +34,18 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
 - [x] **Port enumeration** (`src/kvm/serial_scan.rs`) — SetupAPI, walks the
       device tree, finds CH9329-class interfaces; reports *why* nothing was
       found rather than just "0 ports".
+- [x] **The cable plugged in backwards is named.** Until round 8 the line above
+      overstated it: an empty list printed "no serial ports found" and nothing
+      else. On 2026-10-28 the cable's CH9329 end (`1A86:E129`, "WCH UART TO
+      KB-MS_V1.8") was in this PC and the CH340 end was not, and the app had no
+      way to say so. `sight_cable` now walks every present USB device for both
+      ends, and `explain_missing_cable` (pure, 4 tests) names one of three causes:
+      backwards, a bridge with no driver (no COM port — seen on this PC on
+      2026-10-18 as a classless "USB2.0-Serial"), or nothing plugged in. It shows
+      under the port picker, as an amber **"No KVM cable — why?"** top-bar badge
+      whose tooltip carries the reason (the picker is below the fold of a long
+      pane), in the log, in `--list-ports` and in a port-less `--probe`. Verified
+      against the real cable plugged in backwards, CLI and window.
 - [x] **Key mapping** (`src/kvm/keymap.rs`) — VK → HID, US layout, media keys,
       numpad. 3 real mapping bugs found by tests and fixed
       (numpad off-by-one; `'0'` placed wrongly relative to `'1'..'9'`; a bad
@@ -167,6 +179,13 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
       nothing like it; would be a differentiator).
 - [x] **`README.md` / `docs/CODE_MAP.md`** — README with screenshots, code map, and
       the diagnostics doc are all current as of round 4.
+- [ ] **Flaky test: `logging::tests::captures_and_filters_by_level`.** It and
+      `panel_filter_is_changeable_without_losing_history` both `clear()` the one
+      global ring buffer, so run in parallel one can wipe the other's line between
+      `log` and `snapshot`. Failed once in five runs on 2026-10-28; always passes
+      with `--test-threads=1`. Needs the two tests serialised (a shared test lock).
+- [ ] **Ports do not refresh on hot-plug.** Plugging the cable in while the app is
+      open needs a press of *Refresh ports*; `WM_DEVICECHANGE` would do it.
 - [ ] **Signature / packaging.** Currently a bare (icon-bearing) `.exe` with real
       version info; no installer by design (eframe links statically), and no code
       signing certificate.

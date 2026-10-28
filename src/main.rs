@@ -135,13 +135,17 @@ fn main() -> eframe::Result<()> {
         if ports.is_empty() {
             println!("no serial ports found");
         }
-        for p in ports {
+        for p in &ports {
             println!(
                 "{}{}\n     {}",
                 p.port,
                 if p.is_kvm_cable { "  [KVM cable]" } else { "" },
                 p.hardware_id
             );
+        }
+        let seen = kvm::serial_scan::sight_cable();
+        if let Some(why) = kvm::serial_scan::explain_missing_cable(&ports, &seen) {
+            println!("\n{why}");
         }
         return Ok(());
     }
@@ -153,6 +157,11 @@ fn main() -> eframe::Result<()> {
             .or_else(|| kvm::serial_scan::find_kvm_port().map(|p| p.port));
         let Some(port) = port else {
             eprintln!("no port given and no known KVM cable found");
+            let ports = kvm::serial_scan::list();
+            let seen = kvm::serial_scan::sight_cable();
+            if let Some(why) = kvm::serial_scan::explain_missing_cable(&ports, &seen) {
+                eprintln!("{why}");
+            }
             std::process::exit(1);
         };
         println!("probing {port} ...");

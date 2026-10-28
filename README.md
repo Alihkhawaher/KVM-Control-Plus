@@ -192,7 +192,7 @@ never break the build.
 
 ```sh
 cargo build --release      # target/release/KVM-Control-Plus.exe
-cargo test                 # 58 tests
+cargo test                 # 85 tests
 ```
 
 Requires the MSVC toolchain (Rust 1.93 + VS 2022 verified). The `windows` crate
@@ -213,6 +213,15 @@ Uncompressed 1080p needs 155–207 MB/s. A USB 2.0 link carries about 40 MB/s. O
 a USB 2.0 link **only MJPEG can work** — an uncompressed selection will "stream"
 fine and show you filler frames forever. The app says so instead of leaving you
 to work it out.
+
+**When the KVM cable isn't found**, the app says why instead of showing an empty
+list. The cable has two different ends: the CH340 serial end goes into *this* PC
+and the CH9329 end (it shows up as a keyboard and mouse, "WCH UART TO KB-MS")
+goes into the computer being controlled. If the CH9329 end is the one in this PC,
+the top bar shows an amber **"No KVM cable — why?"** badge whose tooltip, the note
+under the port picker and `--list-ports` all say the cable is plugged in
+backwards. A serial end with no driver (no COM port) and nothing plugged in at all
+are told apart the same way.
 
 **Hide pane** in the top bar collapses the controls for a video-only window, which is
 what you want once a session is running; the choice is remembered in the settings file

@@ -120,13 +120,15 @@ pub fn section(ui: &mut Ui, p: &Palette, title: &str) {
     ui.add_space(4.0);
 }
 
-/// A rounded status chip.
-pub fn pill(ui: &mut Ui, _p: &Palette, text: &str, color: Color32) {
+/// A rounded status chip. Returns its hover response, so a chip can carry a
+/// tooltip that explains it.
+pub fn pill(ui: &mut Ui, _p: &Palette, text: &str, color: Color32) -> egui::Response {
     let galley =
         ui.painter()
             .layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), color);
     let pad = egui::vec2(9.0, 4.0);
-    let (rect, _) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::hover());
     ui.painter()
         .rect_filled(rect, CornerRadius::same(9), color.gamma_multiply(0.16));
     ui.painter().rect_stroke(
@@ -136,6 +138,7 @@ pub fn pill(ui: &mut Ui, _p: &Palette, text: &str, color: Color32) {
         egui::StrokeKind::Inside,
     );
     ui.painter().galley(rect.min + pad, galley, color);
+    response
 }
 
 /// `label            value` row.

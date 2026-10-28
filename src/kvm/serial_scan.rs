@@ -6,6 +6,10 @@
 //! (COM5)") and the *hardware id* (`USB\VID_1A86&PID_7523…`) so the app can
 //! recognise a CH9329 KVM cable automatically. SetupAPI gives all three,
 //! exactly like the original C# project did after it dropped `System.Management`.
+//!
+//! When no cable is listed, [`sight_cable`] + [`explain_missing_cable`] say why:
+//! the cable plugged in backwards (its CH9329 keyboard/mouse end in this PC), a
+//! serial bridge with no driver and so no COM port, or nothing plugged in at all.
 
 #![allow(dead_code)]
 
@@ -48,10 +52,24 @@ pub const KVM_CABLE_VID_PIDS: &[&str] = &[
     "VID_1A86&PID_55D3",
 ];
 
+/// Hardware-id fragments of the cable's **other** end: the CH9329 itself, which
+/// shows up as a keyboard and mouse and belongs in the computer being controlled.
+///
+/// * `VID_1A86&PID_E129` — CH9329 factory default; reports itself as
+///   "WCH UART TO KB-MS". The chip lets its VID/PID be reprogrammed, so a cable
+///   that has been reconfigured will not match.
+pub const KVM_TARGET_END_VID_PIDS: &[&str] = &["VID_1A86&PID_E129"];
+
 /// True when a hardware id belongs to a known KVM-cable serial bridge.
 pub fn is_known_kvm_hardware_id(hardware_id: &str) -> bool {
     let up = hardware_id.to_ascii_uppercase();
     KVM_CABLE_VID_PIDS.iter().any(|frag| up.contains(frag))
+}
+
+/// True when a hardware id is the CH9329 (keyboard/mouse) end of a KVM cable.
+pub fn is_kvm_target_end_hardware_id(hardware_id: &str) -> bool {
+    let up = hardware_id.to_ascii_uppercase();
+    KVM_TARGET_END_VID_PIDS.iter().any(|frag| up.contains(frag))
 }
 
 /// Enumerate every present device in the **Ports (COM & LPT)** class.
@@ -114,6 +132,107 @@ pub fn list() -> Vec<SerialPortInfo> {
 /// The first port that looks like a CH9329 KVM cable, if one is present.
 pub fn find_kvm_port() -> Option<SerialPortInfo> {
     list().into_iter().find(|p| p.is_kvm_cable)
+}
+
+/// What the USB bus shows of a KVM cable, whichever end of it is plugged in.
+///
+/// [`list`] only sees the Ports class, so it cannot tell "no cable" from "the
+/// wrong end of the cable" or "a cable with no driver". This looks at every
+/// present USB device instead, so the empty port list can be explained.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CableSighting {
+    /// Present serial bridges (the end that belongs in **this** PC), any class —
+    /// one without a driver sits outside Ports and has no COM name.
+    pub bridges: Vec<String>,
+    /// Present CH9329 keyboard/mouse ends (the end that belongs in the **target**).
+    pub target_ends: Vec<String>,
+}
+
+/// Walk every present USB device and pick out both ends of a KVM cable.
+pub fn sight_cable() -> CableSighting {
+    let mut seen = CableSighting::default();
+    let enumerator: Vec<u16> = "USB\0".encode_utf16().collect();
+
+    unsafe {
+        let set = match SetupDiGetClassDevsW(
+            None,
+            PCWSTR(enumerator.as_ptr()),
+            None,
+            DIGCF_PRESENT | DIGCF_ALLCLASSES,
+        ) {
+            Ok(h) => h,
+            Err(_) => return seen,
+        };
+
+        let mut data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+
+        let mut i = 0u32;
+        while SetupDiEnumDeviceInfo(set, i, &mut data).is_ok() {
+            i += 1;
+            let hardware_id = read_property_string(set, &data, SPDRP_HARDWAREID);
+            // A composite device lists once per interface (`&MI_00`, `&MI_01`…);
+            // the parent alone stands for the cable.
+            if hardware_id.to_ascii_uppercase().contains("&MI_") {
+                continue;
+            }
+            if is_known_kvm_hardware_id(&hardware_id) {
+                seen.bridges.push(hardware_id);
+            } else if is_kvm_target_end_hardware_id(&hardware_id) {
+                seen.target_ends.push(hardware_id);
+            }
+        }
+
+        let _ = SetupDiDestroyDeviceInfoList(set);
+    }
+    seen
+}
+
+/// Why no KVM cable is in `ports`, in words the user can act on — `None` when
+/// one is there. Pure, so every case is unit-tested without the hardware.
+pub fn explain_missing_cable(ports: &[SerialPortInfo], seen: &CableSighting) -> Option<String> {
+    if ports.iter().any(|p| p.is_kvm_cable) {
+        return None;
+    }
+
+    let other_end_too = if seen.target_ends.is_empty() {
+        ""
+    } else {
+        " Its other end (the CH9329 keyboard/mouse) is plugged into this PC as well; \
+         it belongs in the computer you want to control."
+    };
+
+    if let Some(bridge) = seen.bridges.first() {
+        // A bridge with a COM port would have been flagged above, so this one has none.
+        return Some(format!(
+            "The KVM cable's serial end is plugged in ({bridge}), but Windows gave it \
+             no COM port: its driver is missing or failed. Install the WCH CH340/CH341 \
+             driver (Device Manager shows it under Other devices until then), then \
+             press Refresh ports.{other_end_too}"
+        ));
+    }
+
+    if let Some(target) = seen.target_ends.first() {
+        return Some(format!(
+            "The KVM cable is plugged in backwards. This PC has its keyboard/mouse end \
+             (the CH9329, {target}), which belongs in the computer you want to control. \
+             Plug the other end, which shows up as USB-SERIAL CH340, into this PC and \
+             press Refresh ports."
+        ));
+    }
+
+    let pick_by_hand = if ports.is_empty() {
+        ""
+    } else {
+        " If your cable uses a different serial chip, pick its port from the list by hand."
+    };
+    Some(format!(
+        "No KVM cable found. Plug the cable's serial end (it shows up as USB-SERIAL \
+         CH340) into this PC and the other end into the computer you want to control, \
+         then press Refresh ports.{pick_by_hand}"
+    ))
 }
 
 impl std::fmt::Display for SerialPortInfo {
@@ -209,6 +328,68 @@ mod tests {
         assert!(!is_known_kvm_hardware_id("USB\\VID_046D&PID_C52B")); // Logitech
         assert!(!is_known_kvm_hardware_id("ACPI\\PNP0501")); // motherboard COM
         assert!(!is_known_kvm_hardware_id(""));
+    }
+
+    #[test]
+    fn tells_the_two_ends_apart() {
+        // Both are WCH (1A86), so the PID is all that separates them.
+        assert!(is_kvm_target_end_hardware_id("USB\\VID_1A86&PID_E129&REV_0000"));
+        assert!(!is_kvm_target_end_hardware_id("USB\\VID_1A86&PID_7523&REV_0264"));
+        assert!(!is_known_kvm_hardware_id("USB\\VID_1A86&PID_E129&REV_0000"));
+    }
+
+    fn port(name: &str, is_kvm_cable: bool) -> SerialPortInfo {
+        SerialPortInfo {
+            port: name.into(),
+            friendly_name: String::new(),
+            hardware_id: String::new(),
+            is_kvm_cable,
+        }
+    }
+
+    fn sighting(bridges: &[&str], target_ends: &[&str]) -> CableSighting {
+        CableSighting {
+            bridges: bridges.iter().map(|s| s.to_string()).collect(),
+            target_ends: target_ends.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    const BRIDGE: &str = "USB\\VID_1A86&PID_7523&REV_0264";
+    const TARGET: &str = "USB\\VID_1A86&PID_E129&REV_0000";
+
+    #[test]
+    fn nothing_to_explain_when_a_cable_is_listed() {
+        let ports = [port("COM8", true)];
+        // Even with the other end in this PC too: the serial end works.
+        assert_eq!(explain_missing_cable(&ports, &sighting(&[BRIDGE], &[TARGET])), None);
+    }
+
+    #[test]
+    fn backwards_cable_is_named() {
+        // What ALI-PC showed on 2026-10-28: no ports, only the CH9329 end present.
+        let why = explain_missing_cable(&[], &sighting(&[], &[TARGET])).unwrap();
+        assert!(why.contains("backwards"), "{why}");
+        assert!(why.contains(TARGET), "{why}");
+    }
+
+    #[test]
+    fn bridge_without_a_port_is_a_driver_problem() {
+        // A motherboard COM1 must not hide it.
+        let ports = [port("COM1", false)];
+        let why = explain_missing_cable(&ports, &sighting(&[BRIDGE], &[])).unwrap();
+        assert!(why.contains("driver"), "{why}");
+        assert!(!why.contains("other end"), "{why}");
+        let both = explain_missing_cable(&ports, &sighting(&[BRIDGE], &[TARGET])).unwrap();
+        assert!(both.contains("driver") && both.contains("other end"), "{both}");
+    }
+
+    #[test]
+    fn nothing_plugged_in_says_so() {
+        let why = explain_missing_cable(&[], &sighting(&[], &[])).unwrap();
+        assert!(why.starts_with("No KVM cable found"), "{why}");
+        assert!(!why.contains("by hand"), "{why}");
+        let with_com1 = explain_missing_cable(&[port("COM1", false)], &sighting(&[], &[])).unwrap();
+        assert!(with_com1.contains("by hand"), "{with_com1}");
     }
 
     #[test]

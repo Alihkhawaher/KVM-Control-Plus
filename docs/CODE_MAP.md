@@ -71,7 +71,11 @@ KVM-Control Plus/
    │   ├─ serial_port.rs  Raw Win32 serial handle (CreateFileW, DCB, PurgeComm,
    │   │                  Read/WriteFile). Manual Debug impl.
    │   ├─ serial_scan.rs  SetupAPI enumeration of CH9329-class serial devices,
-   │   │                  with an explanation when the list comes back empty.
+   │   │                  with an explanation when no cable is listed:
+   │   │                  `sight_cable` walks every present USB device for
+   │   │                  *both* ends (CH340 bridge, CH9329 `1A86:E129`), and
+   │   │                  the pure `explain_missing_cable` turns that into
+   │   │                  "plugged in backwards" / "no driver" / "nothing there".
    │   ├─ keymap.rs  VK → HID translation, US layout, media keys, numpad.
    │   ├─ layout.rs  Local keyboard layout → what the remote host will see.
    │   └─ cable.rs   The live link: connection state, sender thread, mouse-move

@@ -71,6 +71,9 @@ pub struct KvmControlPlusApp {
     devices: Vec<VideoDevice>,
     formats: Vec<VideoFormat>,
     ports: Vec<SerialPortInfo>,
+    /// Why no KVM cable is in `ports` (plugged in backwards, no driver, nothing
+    /// there), or `None` when one is. Shown under the port picker.
+    port_note: Option<String>,
     device_sel: usize,
     format_sel: usize,
     port_sel: usize,
@@ -165,9 +168,11 @@ impl KvmControlPlusApp {
             ports.len(),
             devices.len()
         ));
+        let port_note = explain_ports(&ports);
 
         let mut app = KvmControlPlusApp {
             port_sel: 0,
+            port_note,
             device_sel: 0,
             format_sel: 0,
             formats: Vec::new(),
@@ -325,6 +330,7 @@ impl KvmControlPlusApp {
     fn refresh_ports(&mut self) {
         self.ports = serial_scan::list();
         log::info(format!("{} serial port(s)", self.ports.len()));
+        self.port_note = explain_ports(&self.ports);
         if self.port_sel >= self.ports.len() {
             self.port_sel = 0;
         }
@@ -1004,10 +1010,17 @@ impl KvmControlPlusApp {
                     Some(i) => (format!("KVM cable {}", i.version_string()), p.ok),
                     None => ("KVM cable (no handshake)".to_string(), p.warn),
                 }
+            } else if self.port_note.is_some() {
+                // The reason also sits under the port picker, but that is below the
+                // fold of a long pane; the top bar is always in view.
+                ("No KVM cable — why?".to_string(), p.warn)
             } else {
                 ("No KVM cable".to_string(), p.dim)
             };
-            ui::pill(ui, &p, &txt, col);
+            let cable_pill = ui::pill(ui, &p, &txt, col);
+            if let (false, Some(note)) = (cable_ok, &self.port_note) {
+                cable_pill.on_hover_text(note);
+            }
 
             let (vtxt, vcol) = if self.capture.is_some() {
                 (format!("Video {:.0} fps", self.fps), p.ok)
@@ -1242,6 +1255,10 @@ impl KvmControlPlusApp {
                 });
             ui::toggle(ui, &p, "Auto-connect", &mut self.settings.auto_connect, "");
         });
+
+        if let Some(note) = &self.port_note {
+            ui.label(RichText::new(note).color(p.warn).size(12.0));
+        }
 
         ui.horizontal(|ui| {
             if ui.button("⟳ Refresh ports").clicked() {
@@ -2045,6 +2062,21 @@ fn level_color(p: &Palette, level: Level) -> Color32 {
         Level::Warn => p.warn,
         Level::Error => p.bad,
     }
+}
+
+/// Look at the USB bus for either end of the cable and say why `ports` has no
+/// KVM cable in it — logged as well as returned, so `last-run.log` carries it.
+fn explain_ports(ports: &[SerialPortInfo]) -> Option<String> {
+    let seen = serial_scan::sight_cable();
+    log::debug(format!(
+        "cable sighting: bridges {:?}, CH9329 ends {:?}",
+        seen.bridges, seen.target_ends
+    ));
+    let note = serial_scan::explain_missing_cable(ports, &seen);
+    if let Some(n) = &note {
+        log::warn(format!("no KVM cable port: {n}"));
+    }
+    note
 }
 
 /// A compact hub name for the UI: `\\?\usb#root_hub30#4&…` → `root_hub30`.
