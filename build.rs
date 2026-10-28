@@ -18,6 +18,13 @@ fn main() {
         .unwrap_or(0);
     println!("cargo:rustc-env=BUILD_TIMESTAMP={now}");
     println!("cargo:rerun-if-changed=build.rs");
+    // The stamp is only as fresh as the last run of this script, and with only
+    // build.rs and the icon watched it stopped on 2026-10-11 while the code kept
+    // changing. Watching the sources makes it move with every build that changes
+    // the binary (a directory is scanned recursively); a rebuild that changes
+    // nothing keeps the old stamp, which is then still the truth.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     #[cfg(target_os = "windows")]
     build_windows_resources();

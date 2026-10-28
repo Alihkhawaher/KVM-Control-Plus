@@ -10,7 +10,8 @@ KVM-Control Plus/
 │  └─ config.toml    +crt-static: drops the VCRUNTIME140.dll dependency so the
 │                    .exe is genuinely standalone. Do not remove it casually.
 ├─ build.rs          embeds BUILD_TIMESTAMP (unix secs, shown by --version and
-│                    the About tab) AND compiles the Windows resources: it
+│                    the About tab; re-stamped whenever src/ or Cargo.toml
+│                    changes, not only build.rs) AND compiles the Windows resources: it
 │                    generates a .rc and drives the SDK's rc.exe straight to a
 │                    .res, to avoid a winres/embed-resource build dependency.
 │                    Missing rc.exe warns, never fails.
