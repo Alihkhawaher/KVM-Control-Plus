@@ -77,6 +77,13 @@ pub struct Settings {
     pub pic_saturation: f32,
     pub pic_gamma: f32,
 
+    /// Which video source goes with which KVM cable: port (`"COM8"`) → capture
+    /// device id (MediaFoundation symbolic link). Learned from use, never typed:
+    /// each target computer is a cable plus a capture dongle plugged into this PC
+    /// separately, and nothing in the USB tree says which dongle belongs to which
+    /// cable, so the app remembers what was used together.
+    pub pairs: BTreeMap<String, String>,
+
     /// Keys we did not recognise, kept verbatim so nothing is lost on save.
     pub unknown: BTreeMap<String, String>,
 }
@@ -116,6 +123,7 @@ impl Default for Settings {
             pic_contrast: 1.0,
             pic_saturation: 1.0,
             pic_gamma: 1.0,
+            pairs: BTreeMap::new(),
             unknown: BTreeMap::new(),
         }
     }
@@ -232,6 +240,13 @@ impl Settings {
             &format!("{:.3}", self.pic_saturation),
         );
         kv(&mut out, "pic_gamma", &format!("{:.3}", self.pic_gamma));
+        if !self.pairs.is_empty() {
+            out.push_str("\n[pairs]\n");
+            out.push_str("# KVM cable -> the video source used with it, learned from use.\n");
+            for (port, link) in &self.pairs {
+                kv(&mut out, &format!("{PAIR_PREFIX}{port}"), link);
+            }
+        }
         for (k, v) in &self.unknown {
             kv(&mut out, k, v);
         }
@@ -280,6 +295,11 @@ impl Settings {
                 "pic_contrast" => s.pic_contrast = v.parse().unwrap_or(s.pic_contrast),
                 "pic_saturation" => s.pic_saturation = v.parse().unwrap_or(s.pic_saturation),
                 "pic_gamma" => s.pic_gamma = v.parse().unwrap_or(s.pic_gamma),
+                other if other.starts_with(PAIR_PREFIX) && !v.is_empty() => {
+                    // Keys are lower-cased on read; port names are COM8, not com8.
+                    let port = other[PAIR_PREFIX.len()..].to_ascii_uppercase();
+                    s.pairs.insert(port, v);
+                }
                 other => {
                     s.unknown.insert(other.to_string(), v);
                 }
@@ -311,6 +331,34 @@ impl Settings {
         a
     }
 
+    /// The video source last used with the cable on `port`, if any.
+    pub fn video_for_port(&self, port: &str) -> Option<&str> {
+        self.pairs
+            .get(&port.to_ascii_uppercase())
+            .map(String::as_str)
+    }
+
+    /// The port whose cable was last used with the video source `link`.
+    pub fn port_for_video(&self, link: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(_, l)| l.as_str() == link)
+            .map(|(p, _)| p.as_str())
+    }
+
+    /// Remember that the cable on `port` and the video source `link` were used
+    /// together. A video source belongs to one target, so any other cable it was
+    /// paired with loses it. Returns true when something changed (the caller saves).
+    pub fn remember_pair(&mut self, port: &str, link: &str) -> bool {
+        let port = port.to_ascii_uppercase();
+        if port.is_empty() || link.is_empty() || self.video_for_port(&port) == Some(link) {
+            return false;
+        }
+        self.pairs.retain(|p, l| p == &port || l != link);
+        self.pairs.insert(port, link.to_string());
+        true
+    }
+
     /// Store the adjustments back into the settings (the caller saves).
     pub fn set_picture(&mut self, a: &crate::picture::Adjust) {
         self.pic_range = a.range_key().to_string();
@@ -321,6 +369,10 @@ impl Settings {
         self.pic_gamma = a.gamma;
     }
 }
+
+/// Settings-file key prefix of a cable → video pair (`pair_COM8 = …`). The parser
+/// is flat, so the prefix is what marks the line, not the `[pairs]` heading.
+const PAIR_PREFIX: &str = "pair_";
 
 fn kv(out: &mut String, key: &str, value: &str) {
     out.push_str(&format!("{key} = {value}\n"));
@@ -404,6 +456,37 @@ mod tests {
         assert_eq!(a.gamma, 1.0, "NaN must not reach the maths");
         assert_eq!(a.contrast, 0.25);
         assert_eq!(a.brightness, 1.0);
+    }
+
+    const HAGIBIS: &str = r"\\?\usb#vid_345f&pid_2130&mi_00#7&2bd8484c&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\global";
+    const OTHER: &str = r"\\?\usb#vid_534d&pid_2109&mi_00#7&1a2b3c4d&0&0000#{e5323777-f976-4f5b-9b55-b94699c46e44}\global";
+
+    #[test]
+    fn pairs_survive_a_round_trip_and_keep_the_port_case() {
+        let mut s = Settings::default();
+        assert!(s.remember_pair("COM8", HAGIBIS));
+        assert!(s.remember_pair("com9", OTHER));
+        let restored = Settings::from_text(&s.to_text());
+        assert_eq!(restored.video_for_port("COM8"), Some(HAGIBIS));
+        assert_eq!(restored.video_for_port("com9"), Some(OTHER));
+        assert_eq!(restored.port_for_video(OTHER), Some("COM9"));
+        assert!(restored.unknown.is_empty(), "{:?}", restored.unknown);
+    }
+
+    #[test]
+    fn a_video_source_belongs_to_one_cable() {
+        let mut s = Settings::default();
+        s.remember_pair("COM8", HAGIBIS);
+        assert!(!s.remember_pair("COM8", HAGIBIS), "unchanged must not ask for a save");
+        // The dongle moved to the other target: it leaves COM8.
+        assert!(s.remember_pair("COM9", HAGIBIS));
+        assert_eq!(s.video_for_port("COM8"), None);
+        assert_eq!(s.video_for_port("COM9"), Some(HAGIBIS));
+        // A cable gets a new dongle: the old pairing is replaced, not added to.
+        assert!(s.remember_pair("COM9", OTHER));
+        assert_eq!(s.pairs.len(), 1);
+        assert!(!s.remember_pair("", OTHER));
+        assert!(!s.remember_pair("COM8", ""));
     }
 
     #[test]

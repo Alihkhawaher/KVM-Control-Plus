@@ -192,7 +192,7 @@ never break the build.
 
 ```sh
 cargo build --release      # target/release/KVM-Control-Plus.exe
-cargo test                 # 88 tests
+cargo test                 # 90 tests
 ```
 
 Requires the MSVC toolchain (Rust 1.93 + VS 2022 verified). The `windows` crate
@@ -249,6 +249,16 @@ connects to it straight away, switching from the current one. At startup the app
 reconnects the cable used last time, or the only one there; with several and none
 used before it asks rather than guessing, since a guess would put your keyboard on
 the wrong computer. A cable plugged in while another is connected never takes over.
+
+**Each cable remembers its picture.** A target is a KVM cable plus a capture dongle,
+plugged into this PC separately, so nothing in the USB tree says which dongle
+belongs to which cable. The app learns it instead: whenever video runs with a cable
+connected, that pair is saved (`pair_COM8 = …` under `[pairs]` in
+`settings.conf`). From then on, picking the cable switches the picture to its
+dongle — restarting a running picture on it — and picking the dongle connects its
+cable, so one pick chooses the whole target. The video list names each source's
+cable ("Hagibis — with COM8") and numbers dongles that share a name. A dongle
+plugged in while the app is open is picked up with the next device change.
 
 **Are my keys arriving?** *Test keys* in the cable's status card (or `--key-test`)
 taps Caps Lock twice on the other computer and reads its Caps Lock LED back

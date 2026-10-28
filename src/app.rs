@@ -392,6 +392,9 @@ impl KvmControlPlusApp {
     /// remote that can no longer receive them. A KVM cable that has just arrived
     /// is connected when auto-connect is on.
     fn on_devices_changed(&mut self) {
+        // A target is a dongle plus a cable: re-read the video sources first, so
+        // a cable that connects below can bring the dongle it goes with.
+        self.rescan_video_devices();
         let before: Vec<String> = self.ports.iter().map(|p| p.port.clone()).collect();
         self.refresh_ports();
 
@@ -799,6 +802,7 @@ impl KvmControlPlusApp {
                 log::info(&msg);
                 self.set_toast(msg, color);
                 self.cable = Some(cable);
+                self.follow_pair_to_video();
                 self.save_settings();
             }
             Err(e) => {
@@ -808,6 +812,121 @@ impl KvmControlPlusApp {
                     self.palette.bad,
                 );
             }
+        }
+    }
+
+    /// The connected cable has a video source it was used with before: switch
+    /// the picture to it — restarting a running picture on the new source — so
+    /// choosing a target is one pick, not two. Nothing happens when the pair is
+    /// unknown or its dongle is not plugged in.
+    fn follow_pair_to_video(&mut self) {
+        let Some(port) = self.cable.as_ref().map(|c| c.port_name().to_string()) else {
+            return;
+        };
+        let Some(link) = self.settings.video_for_port(&port).map(str::to_string) else {
+            return;
+        };
+        let Some(i) = self.devices.iter().position(|d| d.symbolic_link == link) else {
+            log::debug(format!("the video source paired with {port} is not plugged in"));
+            return;
+        };
+        if i == self.device_sel {
+            return;
+        }
+        let live = self.capture.is_some();
+        if live {
+            self.stop_video(false);
+        }
+        self.select_video(i);
+        let name = self.video_label(i);
+        log::info(format!("video switched to {name}: it goes with the KVM cable on {port}"));
+        self.set_toast(
+            format!("Video switched to {name} — it goes with the cable on {port}"),
+            self.palette.accent,
+        );
+        if live {
+            self.start_video();
+        }
+    }
+
+    /// The other direction: a video source was picked, so connect the cable it
+    /// was used with, when that cable is plugged in and not already connected.
+    fn follow_pair_to_cable(&mut self) {
+        let Some(link) = self.devices.get(self.device_sel).map(|d| d.symbolic_link.clone()) else {
+            return;
+        };
+        let Some(port) = self.settings.port_for_video(&link).map(str::to_string) else {
+            return;
+        };
+        let connected = self.cable.as_ref().map(|c| c.port_name().to_string());
+        if connected.as_deref() == Some(port.as_str()) || !self.ports.iter().any(|p| p.port == port) {
+            return;
+        }
+        log::info(format!("video source picked — connecting its KVM cable on {port}"));
+        let was_capturing = self.capturing;
+        self.select_port(&port);
+        self.connect();
+        if was_capturing && self.cable.is_some() {
+            self.set_capture(true);
+        }
+    }
+
+    /// Select video source `i` and the remembered capture format on it.
+    fn select_video(&mut self, i: usize) {
+        self.device_sel = i;
+        self.refresh_formats();
+        if let Some(f) = self
+            .formats
+            .iter()
+            .position(|f| f.label().eq_ignore_ascii_case(&self.settings.video_format))
+        {
+            self.format_sel = f;
+        }
+    }
+
+    /// How a video source is shown: its name, numbered when two dongles share a
+    /// name, and the cable it goes with when one is known.
+    fn video_label(&self, i: usize) -> String {
+        let Some(d) = self.devices.get(i) else {
+            return String::new();
+        };
+        let mut label = d.name.clone();
+        if self.devices.iter().filter(|o| o.name == d.name).count() > 1 {
+            let n = self.devices[..i].iter().filter(|o| o.name == d.name).count() + 1;
+            label = format!("{label} #{n}");
+        }
+        if let Some(port) = self.settings.port_for_video(&d.symbolic_link) {
+            label.push_str(&format!("  — with {port}"));
+        }
+        label
+    }
+
+    /// Re-read the video sources after a device change, without disturbing a
+    /// running picture: the selection is kept by id, and only when it has gone
+    /// (with no picture running) does the selection move.
+    fn rescan_video_devices(&mut self) {
+        let list = match mf::list_devices() {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn(format!("video enumeration failed after a device change: {e}"));
+                return;
+            }
+        };
+        let same = list.len() == self.devices.len()
+            && list
+                .iter()
+                .zip(&self.devices)
+                .all(|(a, b)| a.symbolic_link == b.symbolic_link);
+        if same {
+            return;
+        }
+        let selected = self.devices.get(self.device_sel).map(|d| d.symbolic_link.clone());
+        self.devices = list;
+        log::info(format!("{} video source(s) after a device change", self.devices.len()));
+        match selected.and_then(|s| self.devices.iter().position(|d| d.symbolic_link == s)) {
+            Some(i) => self.device_sel = i,
+            None if self.capture.is_none() => self.select_video(0),
+            None => self.device_sel = 0,
         }
     }
 
@@ -862,10 +981,20 @@ impl KvmControlPlusApp {
         ) {
             Ok(c) => {
                 log::info(format!("video started: {} [{}]", d.name, label));
+                // A picture running with a cable connected is what a pair is:
+                // remember it, so picking either one later brings the other.
+                let link = d.symbolic_link.clone();
+                let name = d.name.clone();
                 self.capture = Some(c);
                 self.frame_rx = Some(rx);
                 self.frames = Some(frames);
                 self.video_error = None;
+                if let Some(port) = self.cable.as_ref().map(|c| c.port_name().to_string()) {
+                    if self.settings.remember_pair(&port, &link) {
+                        log::info(format!("paired: KVM cable {port} goes with video source {name}"));
+                        self.save_settings();
+                    }
+                }
             }
             Err(e) => {
                 log::error(format!("video failed: {e}"));
@@ -1449,25 +1578,35 @@ impl KvmControlPlusApp {
 
         // ---- video ----
         ui::section(ui, &p, "VIDEO SOURCE");
-        let dev_label = self
-            .devices
-            .get(self.device_sel)
-            .map(|d| d.name.clone())
-            .unwrap_or_else(|| "(no capture device found)".into());
+        let dev_label = if self.devices.is_empty() {
+            "(no capture device found)".to_string()
+        } else {
+            self.video_label(self.device_sel)
+        };
+        let labels: Vec<String> = (0..self.devices.len()).map(|i| self.video_label(i)).collect();
         let mut dev_pick: Option<usize> = None;
         egui::ComboBox::from_id_salt("device")
             .selected_text(dev_label)
             .width(ui.available_width() - 8.0)
             .show_ui(ui, |ui| {
-                for (i, d) in self.devices.iter().enumerate() {
-                    if ui.selectable_label(self.device_sel == i, &d.name).clicked() {
+                for (i, label) in labels.iter().enumerate() {
+                    if ui.selectable_label(self.device_sel == i, label).clicked() {
                         dev_pick = Some(i);
                     }
                 }
             });
-        if let Some(i) = dev_pick {
-            self.device_sel = i;
-            self.refresh_formats();
+        // Picking a source switches a running picture to it, and brings the
+        // cable it goes with — one pick chooses the whole target.
+        if let Some(i) = dev_pick.filter(|&i| i != self.device_sel) {
+            let live = self.capture.is_some();
+            if live {
+                self.stop_video(false);
+            }
+            self.select_video(i);
+            self.follow_pair_to_cable();
+            if live {
+                self.start_video();
+            }
             self.save_settings();
         }
 

@@ -42,7 +42,8 @@ KVM-Control Plus/
    │                 colours against the active palette (colour is presentation,
    │                 so it does not live in `logging`).
    ├─ config.rs      Settings: hand-rolled `key = value`, no serde. Load is
-   │                 once-logged (startup reads it twice).
+   │                 once-logged (startup reads it twice). `pairs` holds the
+   │                 learned cable → video source pairs (`pair_COM8 = …`).
    ├─ logging.rs     Ring-buffer logger + Level. Feeds stdout, the GUI log panel,
    │                 and (for GUI runs) `last-run.log` — a fatal message from the
    │                 runtime itself must not vanish with the console again.

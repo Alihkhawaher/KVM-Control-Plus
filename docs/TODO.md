@@ -14,7 +14,7 @@ A Rust rewrite of the C#/WinUI3 `Control3` (laptop-as-KVM: MS2130 capture dongle
 + CH9329 serial HID bridge). The whole app is **two direct dependencies** —
 `eframe` (GUI) and `windows` (all platform plumbing). Nothing else.
 
-Current state: **builds clean, 0 warnings, 88/88 tests pass**, and the full path
+Current state: **builds clean, 0 warnings, 90/90 tests pass**, and the full path
 has been exercised against the real Hagibis MS2130 dongle on this machine.
 
 ---
@@ -220,6 +220,19 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
       the remembered cable or the only one, and asks when there are several and
       none is remembered. A cable plugged in while one is connected never takes
       over. Not yet tried with a second cable.
+- [~] **Each cable brings its own picture (learned pairs).** With several targets,
+      each one is a cable and a capture dongle plugged in separately, so the USB
+      tree cannot say which dongle goes with which cable (pairing by a shared hub
+      only works for an all-in-one box, which was considered and dropped on
+      2026-10-28). `Settings.pairs` (`pair_COM8 = <symbolic link>`, tested
+      round-trip; one dongle per cable, one cable per dongle) is learned when
+      video starts with a cable connected. `follow_pair_to_video` switches the
+      picture when a cable is connected; `follow_pair_to_cable` connects the
+      cable when a source is picked; `video_label` shows "— with COM8" and numbers
+      same-named dongles; `rescan_video_devices` re-reads sources on a device
+      change without disturbing a running picture. Verified: a stored pair loads
+      and labels the source on screen. **Not yet verified: switching between two
+      targets — this PC has one dongle and one cable.**
 - [ ] **`last-run.log` keeps one run only.** The run in which the mouse "froze"
       was overwritten by the next launch before it could be read. Keep the
       previous run as `prev-run.log`.
