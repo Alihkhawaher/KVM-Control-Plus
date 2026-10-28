@@ -28,16 +28,69 @@ pub struct SerialPortInfo {
     pub hardware_id: String,
     /// True when the hardware id matches a known CH9329 KVM cable bridge.
     pub is_kvm_cable: bool,
+    /// Where it is plugged in, as Windows reports it (`"Port_#0002.Hub_#0004"`).
+    /// Two cables of the same model have the same name and id; this is what
+    /// tells them apart.
+    pub location: String,
 }
 
 impl SerialPortInfo {
-    /// Display string for the combo box.
+    /// Display string for the combo box: the device name, plus the USB socket
+    /// when Windows reports one, so two identical cables can be told apart.
     pub fn label(&self) -> String {
-        if self.friendly_name.is_empty() {
+        let name = if self.friendly_name.is_empty() {
             self.port.clone()
         } else {
             self.friendly_name.clone()
+        };
+        match describe_location(&self.location) {
+            Some(place) => format!("{name} — {place}"),
+            None => name,
         }
+    }
+}
+
+/// `"Port_#0002.Hub_#0004"` → `"USB port 2, hub 4"`; `None` for anything else.
+pub fn describe_location(location: &str) -> Option<String> {
+    let mut port = None;
+    let mut hub = None;
+    for part in location.split('.') {
+        if let Some(n) = part.strip_prefix("Port_#") {
+            port = n.parse::<u32>().ok();
+        } else if let Some(n) = part.strip_prefix("Hub_#") {
+            hub = n.parse::<u32>().ok();
+        }
+    }
+    match (port, hub) {
+        (Some(p), Some(h)) => Some(format!("USB port {p}, hub {h}")),
+        (Some(p), None) => Some(format!("USB port {p}")),
+        _ => None,
+    }
+}
+
+/// Which KVM cable to connect to without asking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CableChoice {
+    /// No KVM cable present.
+    None,
+    /// Connect to this port: the one used last time, or the only one there.
+    Connect(String),
+    /// Several cables and none of them was used last time: the user picks.
+    Ask(usize),
+}
+
+/// Pick the cable to connect to: the one remembered from last time when it is
+/// present, else the only one, else nobody — with two or more and none
+/// remembered, guessing would put the keyboard on the wrong computer.
+pub fn choose_cable(ports: &[SerialPortInfo], remembered: &str) -> CableChoice {
+    let cables: Vec<&SerialPortInfo> = ports.iter().filter(|p| p.is_kvm_cable).collect();
+    if let Some(p) = cables.iter().find(|p| !remembered.is_empty() && p.port == remembered) {
+        return CableChoice::Connect(p.port.clone());
+    }
+    match cables.as_slice() {
+        [] => CableChoice::None,
+        [only] => CableChoice::Connect(only.port.clone()),
+        many => CableChoice::Ask(many.len()),
     }
 }
 
@@ -104,12 +157,14 @@ pub fn list() -> Vec<SerialPortInfo> {
             let friendly_name = read_property_string(set, &data, SPDRP_FRIENDLYNAME);
             let hardware_id = read_property_string(set, &data, SPDRP_HARDWAREID);
             let is_kvm_cable = is_known_kvm_hardware_id(&hardware_id);
+            let location = read_property_string(set, &data, SPDRP_LOCATION_INFORMATION);
 
             out.push(SerialPortInfo {
                 port,
                 friendly_name,
                 hardware_id,
                 is_kvm_cable,
+                location,
             });
         }
 
@@ -209,8 +264,8 @@ pub fn explain_missing_cable(ports: &[SerialPortInfo], seen: &CableSighting) -> 
         return Some(format!(
             "The KVM cable's serial end is plugged in ({bridge}), but Windows gave it \
              no COM port: its driver is missing or failed. Install the WCH CH340/CH341 \
-             driver (Device Manager shows it under Other devices until then), then \
-             press Refresh ports.{other_end_too}"
+             driver (Device Manager shows it under Other devices until then); the \
+             app picks the port up as soon as it appears.{other_end_too}"
         ));
     }
 
@@ -218,8 +273,8 @@ pub fn explain_missing_cable(ports: &[SerialPortInfo], seen: &CableSighting) -> 
         return Some(format!(
             "The KVM cable is plugged in backwards. This PC has its keyboard/mouse end \
              (the CH9329, {target}), which belongs in the computer you want to control. \
-             Plug the other end, which shows up as USB-SERIAL CH340, into this PC and \
-             press Refresh ports."
+             Plug the other end, which shows up as USB-SERIAL CH340, into this PC; \
+             the app picks it up as soon as it appears."
         ));
     }
 
@@ -230,8 +285,8 @@ pub fn explain_missing_cable(ports: &[SerialPortInfo], seen: &CableSighting) -> 
     };
     Some(format!(
         "No KVM cable found. Plug the cable's serial end (it shows up as USB-SERIAL \
-         CH340) into this PC and the other end into the computer you want to control, \
-         then press Refresh ports.{pick_by_hand}"
+         CH340) into this PC and the other end into the computer you want to control; \
+         the app picks it up as soon as it appears.{pick_by_hand}"
     ))
 }
 
@@ -344,7 +399,46 @@ mod tests {
             friendly_name: String::new(),
             hardware_id: String::new(),
             is_kvm_cable,
+            location: String::new(),
         }
+    }
+
+    #[test]
+    fn location_names_the_socket() {
+        assert_eq!(
+            describe_location("Port_#0002.Hub_#0004").as_deref(),
+            Some("USB port 2, hub 4")
+        );
+        assert_eq!(describe_location("Port_#0011").as_deref(), Some("USB port 11"));
+        assert_eq!(describe_location(""), None);
+        assert_eq!(describe_location("0000.0014.0000.002.000"), None);
+    }
+
+    #[test]
+    fn two_identical_cables_get_different_labels() {
+        let mut a = port("COM8", true);
+        let mut b = port("COM9", true);
+        a.friendly_name = "USB-SERIAL CH340 (COM8)".into();
+        b.friendly_name = "USB-SERIAL CH340 (COM9)".into();
+        a.location = "Port_#0002.Hub_#0004".into();
+        b.location = "Port_#0003.Hub_#0004".into();
+        assert_eq!(a.label(), "USB-SERIAL CH340 (COM8) — USB port 2, hub 4");
+        assert_ne!(a.label(), b.label());
+    }
+
+    #[test]
+    fn cable_choice_never_guesses_between_several() {
+        let one = [port("COM1", false), port("COM8", true)];
+        assert_eq!(choose_cable(&one, ""), CableChoice::Connect("COM8".into()));
+        // A remembered port that is gone does not block the only one present.
+        assert_eq!(choose_cable(&one, "COM9"), CableChoice::Connect("COM8".into()));
+
+        let two = [port("COM8", true), port("COM9", true)];
+        assert_eq!(choose_cable(&two, ""), CableChoice::Ask(2));
+        assert_eq!(choose_cable(&two, "COM5"), CableChoice::Ask(2));
+        assert_eq!(choose_cable(&two, "COM9"), CableChoice::Connect("COM9".into()));
+
+        assert_eq!(choose_cable(&[port("COM1", false)], "COM1"), CableChoice::None);
     }
 
     fn sighting(bridges: &[&str], target_ends: &[&str]) -> CableSighting {
@@ -395,24 +489,9 @@ mod tests {
     #[test]
     fn sorts_kvm_cables_first_then_numeric_com_index() {
         let mut v = vec![
-            SerialPortInfo {
-                port: "COM10".into(),
-                friendly_name: String::new(),
-                hardware_id: String::new(),
-                is_kvm_cable: false,
-            },
-            SerialPortInfo {
-                port: "COM3".into(),
-                friendly_name: String::new(),
-                hardware_id: String::new(),
-                is_kvm_cable: true,
-            },
-            SerialPortInfo {
-                port: "COM2".into(),
-                friendly_name: String::new(),
-                hardware_id: String::new(),
-                is_kvm_cable: false,
-            },
+            port("COM10", false),
+            port("COM3", true),
+            port("COM2", false),
         ];
         v.sort_by_key(|p| {
             (

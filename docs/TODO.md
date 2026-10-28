@@ -14,7 +14,7 @@ A Rust rewrite of the C#/WinUI3 `Control3` (laptop-as-KVM: MS2130 capture dongle
 + CH9329 serial HID bridge). The whole app is **two direct dependencies** —
 `eframe` (GUI) and `windows` (all platform plumbing). Nothing else.
 
-Current state: **builds clean, 0 warnings, 85/85 tests pass**, and the full path
+Current state: **builds clean, 0 warnings, 88/88 tests pass**, and the full path
 has been exercised against the real Hagibis MS2130 dongle on this machine.
 
 ---
@@ -172,20 +172,77 @@ has been exercised against the real Hagibis MS2130 dongle on this machine.
       real moving picture has *not* been confirmed in-app, because the HDMI
       source on this machine was asleep every time it was tested (that produces
       a correct black frame). Needs one session with the source awake.
-- [ ] **Mouse: relative mode.** Only absolute works today; relative HID mode for
-      games is sketched in `ch9329.rs` but not wired to the UI.
+- [x] **Mouse: both modes are wired.** Absolute over the picture by default,
+      relative while grabbed (`grab_input`). (This line used to say only absolute
+      worked; the grab path was in fact relative all along.)
 - [ ] **Macros** — the tab exists, the recorder/player does not.
 - [ ] **Clipboard / file transfer** over the serial link (the original app had
       nothing like it; would be a differentiator).
 - [x] **`README.md` / `docs/CODE_MAP.md`** — README with screenshots, code map, and
       the diagnostics doc are all current as of round 4.
+- [x] **Video and KVM start from one button.** Starting the keyboard and mouse
+      used to be a separate *Start session* on the Input tab, and starting it
+      froze the local cursor with nothing on screen saying why or how to get out.
+      On 2026-10-28 that read as "my mouse froze": the remote screen was black, so
+      nothing moved anywhere. Now the Devices tab's button is **Start video + KVM**
+      when a cable is connected (`start_session`), **Stop** releases input before
+      it stops video (`stop_session`), **Control KVM** or a click on the picture
+      takes control again after leaving, and the picture shows a banner naming
+      every enabled way out (`leave_hint`; Ctrl+Alt+Del when gesture and panic
+      hotkey are both off) plus a note when the remote screen is entirely black
+      (luma max ≤ 20). The toast on capture says the same. Verified: one click
+      logged "video started" then "input capture ON"; the banner seen on screen.
+- [x] **Is the target receiving input? Yes — the picture is what is missing.** In
+      that session the picture stayed solid black (1,169 frames at luma 7…7) for
+      ~19 s of captured movement, and the report was "no keys sent to the pc".
+      `Cable::caps_lock_round_trip` (GUI: *Test keys*; CLI: `--key-test`) taps
+      Caps Lock and reads the CH9329's LED report back: the target's own OS sets
+      that LED. On 2026-10-28, twice: `Caps Lock off -> on -> off` — keys arrive.
+      The black picture is the HDMI source, not the input path. Building it found
+      a real bug: `round_trip` read the first frame in the buffer, which while
+      streaming is a stale acknowledgement of a report (`57 AB 00 82 …`), so any
+      live query failed. It now purges first and skips non-matching frames.
+- [x] **No grab by default — the remote-desktop way of working.** Asked for on
+      2026-10-28: "I do not want the app to grab my mouse… like RustDesk".
+      `drive_remote_from_picture` sends the pointer over the picture as CH9329
+      **absolute** positions (0..4095, `Cable::mouse_abs_move`, coalesced to the
+      newest because 9600 baud carries ~70 frames/s), presses that begin in the
+      picture as clicks there, and the wheel; the local cursor is never touched.
+      The keyboard hook gained a keyboard-only switch (`set_keyboard_forward`)
+      that follows the picture's focus and releases every remote key when it
+      turns off. Grabbing (`grab_input`, Input tab) is opt-in and keeps the old
+      relative-mouse capture. **Not yet seen on the target**: the HDMI picture is
+      black, so the pointer cannot be watched yet.
+- [x] **Several KVM cables, chosen by the user.** `SerialPortInfo.location`
+      (SPDRP_LOCATION_INFORMATION) names each cable's USB socket, so identical
+      cables differ in the list; the list moved above the link report; picking a
+      cable connects to it (switching); `choose_cable` (pure, tested) reconnects
+      the remembered cable or the only one, and asks when there are several and
+      none is remembered. A cable plugged in while one is connected never takes
+      over. Not yet tried with a second cable.
+- [ ] **`last-run.log` keeps one run only.** The run in which the mouse "froze"
+      was overwritten by the next launch before it could be read. Keep the
+      previous run as `prev-run.log`.
 - [ ] **Flaky test: `logging::tests::captures_and_filters_by_level`.** It and
       `panel_filter_is_changeable_without_losing_history` both `clear()` the one
       global ring buffer, so run in parallel one can wipe the other's line between
       `log` and `snapshot`. Failed once in five runs on 2026-10-28; always passes
       with `--test-threads=1`. Needs the two tests serialised (a shared test lock).
-- [ ] **Ports do not refresh on hot-plug.** Plugging the cable in while the app is
-      open needs a press of *Refresh ports*; `WM_DEVICECHANGE` would do it.
+- [~] **The cable is picked up when it is plugged in, and released when it is
+      pulled out.** Before this, the port list was read once at startup and again
+      only on *Refresh ports*: on 2026-10-28 the cable was turned the right way
+      round with the app open, COM8 appeared at 17:57:15, and the app never
+      looked. The input thread's hidden window is top-level, so it already
+      receives Windows' `WM_DEVICECHANGE` broadcasts; it forwards them as
+      `InputEvent::DevicesChanged` and wakes the GUI. The app waits until the
+      burst has been quiet for 500 ms (the COM port is the last thing a plug-in
+      creates), rescans, keeps the selected port by name, and then: connects a
+      KVM cable that has just arrived when auto-connect is on (or says "press
+      Connect" when it is off); releases a connected cable whose port has gone,
+      which also hands the keyboard and mouse back; and reopens one that came
+      back within a single settle. The backwards-cable note follows the plug too.
+      Verified: startup auto-connect to COM8 (CH9329 V1.8, target connected).
+      **Not yet verified: a real unplug and replug with the app open.**
 - [ ] **Signature / packaging.** Currently a bare (icon-bearing) `.exe` with real
       version info; no installer by design (eframe links statically), and no code
       signing certificate.

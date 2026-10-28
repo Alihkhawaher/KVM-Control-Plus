@@ -150,6 +150,37 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // ---- does a key press reach the target? -------------------------------
+    // The picture can be black for reasons that have nothing to do with input,
+    // so this answers from the target's own Caps Lock LED instead.
+    if let Some(i) = args.iter().position(|a| a == "--key-test") {
+        let port = args
+            .get(i + 1)
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .or_else(|| kvm::serial_scan::find_kvm_port().map(|p| p.port));
+        let Some(port) = port else {
+            eprintln!("no port given and no known KVM cable found");
+            std::process::exit(1);
+        };
+        println!("key test on {port}: tapping Caps Lock twice on the target ...");
+        match kvm::cable::Cable::open(&port, kvm::cable::DEFAULT_BAUD) {
+            Ok(cable) => {
+                let check = cable.caps_lock_round_trip();
+                println!("  {}", check.verdict());
+                cable.close();
+                if !check.keys_arrive() {
+                    std::process::exit(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("could not open {port}: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--probe") {
         let port = args
             .get(i + 1)
@@ -754,6 +785,8 @@ INSPECTION (no GUI):
     --list-formats [DEVICE]     list a device's native formats (index or name)
     --list-ports                list serial ports, flagging known KVM cables
     --probe [COM]               open the cable and read CH9329 chip info
+    --key-test [COM]            tap Caps Lock twice on the target and read its
+                                LED back: proves keys arrive, no picture needed
 
 DIAGNOSTICS:
     --usb                       measure the real negotiated USB link speed

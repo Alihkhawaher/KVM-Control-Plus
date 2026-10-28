@@ -32,7 +32,12 @@ KVM-Control Plus/
    │                 2026-10-11 is a reproducible measurement rather than a story.
    ├─ app.rs         The application: state machine, tabs, panels, and the
    │                 "link & formats" report. Largest file by design — one place
-   │                 to see what the UI does. Holds the pane toggle
+   │                 to see what the UI does. `start_session` / `stop_session`
+   │                 run video and KVM as one (input is always released before
+   │                 video stops). `drive_remote_from_picture` is the default,
+   │                 no-grab way of working: pointer over the picture → absolute
+   │                 positions, keyboard follows the picture's focus. Grab mode
+   │                 (`grab_input`) is opt-in; `leave_hint` names its way out. Holds the pane toggle
    │                 (`show_left_pane`) and `level_color`, which resolves log
    │                 colours against the active palette (colour is presentation,
    │                 so it does not live in `logging`).
@@ -63,6 +68,10 @@ KVM-Control Plus/
    │   ├─ hook.rs    Dedicated input thread: own hidden window + message pump,
    │   │             WH_KEYBOARD_LL / WH_MOUSE_LL hooks, Raw Input for
    │   │             high-resolution movement. Posts InputEvent to the app.
+   │   │             The window is top-level so it hears WM_DEVICECHANGE; it
+   │   │             posts DevicesChanged and wakes the GUI, which rescans the
+   │   │             ports once the burst settles (`on_devices_changed` in
+   │   │             app.rs: connect on arrival, release on removal).
    │   └─ leave.rs   LeaveGesture — the "get me out of here" hotkey handling.
    ├─ kvm/
    │   ├─ mod.rs     Re-exports.
@@ -77,10 +86,14 @@ KVM-Control Plus/
    │   │                  *both* ends (CH340 bridge, CH9329 `1A86:E129`), and
    │   │                  the pure `explain_missing_cable` turns that into
    │   │                  "plugged in backwards" / "no driver" / "nothing there".
+   │   │                  `choose_cable` (pure) decides which of several cables
+   │   │                  to connect without asking — never a guess.
    │   ├─ keymap.rs  VK → HID translation, US layout, media keys, numpad.
    │   ├─ layout.rs  Local keyboard layout → what the remote host will see.
    │   └─ cable.rs   The live link: connection state, sender thread, mouse-move
-   │                 coalescing, counters.
+   │                 coalescing (relative deltas summed, absolute positions
+   │                 newest-wins), counters, and `caps_lock_round_trip` — the
+   │                 picture-free proof that keys reach the target.
    └─ video/
        ├─ mod.rs     Re-exports + the BMP snapshot writer.
        ├─ mf.rs      MediaFoundation: device enumeration, native-format listing,

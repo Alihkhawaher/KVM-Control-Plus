@@ -74,6 +74,9 @@ pub struct KvmControlPlusApp {
     /// Why no KVM cable is in `ports` (plugged in backwards, no driver, nothing
     /// there), or `None` when one is. Shown under the port picker.
     port_note: Option<String>,
+    /// When to rescan ports after Windows reported a device change. Pushed back
+    /// by every message in a burst, so the scan runs once the burst has settled.
+    ports_rescan_at: Option<std::time::Instant>,
     device_sel: usize,
     format_sel: usize,
     port_sel: usize,
@@ -128,7 +131,21 @@ pub struct KvmControlPlusApp {
 
     // ---- ui state ----
     tab: Tab,
+    /// Grab mode only (`settings.grab_input`): keyboard and mouse captured, local
+    /// cursor frozen.
     capturing: bool,
+    // ---- the remote-desktop way of working (no grab, the default) ----
+    /// The picture has keyboard focus: a press inside it gives it, a press
+    /// anywhere else in the window (or the window losing focus) takes it away.
+    picture_focus: bool,
+    /// What the keyboard hook was last told, so it is told only on a change.
+    kb_forward: bool,
+    /// Buttons held on the remote by a press that began inside the picture.
+    remote_buttons: u8,
+    /// Last absolute position sent, so an unmoved pointer sends nothing.
+    last_abs: Option<(u16, u16)>,
+    /// Fractions of a wheel notch not yet sent (touchpads scroll in pixels).
+    wheel_accum: f32,
     fullscreen_video: bool,
     toast: Option<Toast>,
     macro_text: String,
@@ -173,6 +190,7 @@ impl KvmControlPlusApp {
         let mut app = KvmControlPlusApp {
             port_sel: 0,
             port_note,
+            ports_rescan_at: None,
             device_sel: 0,
             format_sel: 0,
             formats: Vec::new(),
@@ -203,6 +221,11 @@ impl KvmControlPlusApp {
             latency_samples: 0,
             tab: Tab::Devices,
             capturing: false,
+            picture_focus: false,
+            kb_forward: false,
+            remote_buttons: 0,
+            last_abs: None,
+            wheel_accum: 0.0,
             fullscreen_video: false,
             toast: None,
             macro_text: String::new(),
@@ -265,7 +288,12 @@ impl KvmControlPlusApp {
     }
 
     fn start_input_thread(&mut self) {
-        match InputThread::start(self.input_tx.clone(), self.settings.leave_gesture) {
+        let wake_ctx = self.ctx.clone();
+        match InputThread::start(
+            self.input_tx.clone(),
+            self.settings.leave_gesture,
+            Box::new(move || wake_ctx.request_repaint()),
+        ) {
             Ok(t) => {
                 self.apply_input_settings(&t);
                 self.input = Some(t);
@@ -287,23 +315,41 @@ impl KvmControlPlusApp {
         t.set_leave_gesture(self.settings.leave_gesture);
     }
 
-    /// Auto-connect to a detected KVM cable at startup.
+    /// Auto-connect to a detected KVM cable at startup: the one used last time,
+    /// or the only one there. With several and none remembered it asks instead —
+    /// a guess would send the keyboard to the wrong computer.
     fn try_auto_connect(&mut self) {
         if self.ports.is_empty() {
             log::info("no serial ports present — video will be view-only");
             return;
         }
-        let idx = self.ports.iter().position(|p| p.is_kvm_cable).unwrap_or(0);
-        self.port_sel = idx;
-        if self.ports[idx].is_kvm_cable {
-            log::info(format!(
-                "auto-connecting to detected KVM cable on {}",
-                self.ports[idx].port
-            ));
-            self.connect();
-        } else {
-            log::info("no KVM cable detected; select a port manually to enable input");
+        match serial_scan::choose_cable(&self.ports, &self.settings.com_port) {
+            serial_scan::CableChoice::Connect(port) => {
+                self.select_port(&port);
+                log::info(format!("auto-connecting to detected KVM cable on {port}"));
+                self.connect();
+            }
+            serial_scan::CableChoice::Ask(n) => {
+                self.ask_which_cable(n);
+            }
+            serial_scan::CableChoice::None => {
+                log::info("no KVM cable detected; select a port manually to enable input");
+            }
         }
+    }
+
+    fn select_port(&mut self, port: &str) {
+        if let Some(i) = self.ports.iter().position(|p| p.port == port) {
+            self.port_sel = i;
+        }
+    }
+
+    fn ask_which_cable(&mut self, n: usize) {
+        log::info(format!("{n} KVM cables present and none used before — waiting for a pick"));
+        self.set_toast(
+            format!("{n} KVM cables found — pick one under KVM CABLE on the Devices tab"),
+            self.palette.accent,
+        );
     }
 
     // ------------------------------------------------------------------
@@ -328,11 +374,82 @@ impl KvmControlPlusApp {
     }
 
     fn refresh_ports(&mut self) {
+        let selected = self.ports.get(self.port_sel).map(|p| p.port.clone());
         self.ports = serial_scan::list();
         log::info(format!("{} serial port(s)", self.ports.len()));
         self.port_note = explain_ports(&self.ports);
-        if self.port_sel >= self.ports.len() {
-            self.port_sel = 0;
+        // Keep the pick by name, since a plug-in can reorder the list. If it has
+        // gone, index 0 is the best guess: `list` puts KVM cables first.
+        self.port_sel = selected
+            .and_then(|name| self.ports.iter().position(|p| p.port == name))
+            .unwrap_or(0);
+    }
+
+    /// Windows reported a device change and the burst has settled: rescan, and
+    /// act on what changed, so the user never has to press Refresh ports.
+    /// A connected cable that has gone is released — which also hands the
+    /// keyboard and mouse back, as they would otherwise still be swallowed for a
+    /// remote that can no longer receive them. A KVM cable that has just arrived
+    /// is connected when auto-connect is on.
+    fn on_devices_changed(&mut self) {
+        let before: Vec<String> = self.ports.iter().map(|p| p.port.clone()).collect();
+        self.refresh_ports();
+
+        if let Some(cable) = self.cable.clone() {
+            let port = cable.port_name().to_string();
+            if self.ports.iter().any(|p| p.port == port) {
+                // Unplugged and back within one settle: the port is listed again
+                // but this handle died on its first failed write. Reopen it.
+                if !cable.is_alive() {
+                    log::warn(format!("KVM cable on {port} came back — reconnecting"));
+                    self.connect();
+                }
+                return;
+            }
+            log::warn(format!("KVM cable on {port} was unplugged — releasing it"));
+            self.disconnect(false);
+            self.set_toast(
+                format!("KVM cable unplugged ({port}) — local input restored"),
+                self.palette.warn,
+            );
+        }
+
+        let Some(arrived) = self
+            .ports
+            .iter()
+            .find(|p| p.is_kvm_cable && !before.contains(&p.port))
+            .map(|p| p.port.clone())
+        else {
+            return;
+        };
+
+        // Already driving one: never switch on a plug-in, only on a pick.
+        if let Some(current) = self.cable.as_ref().map(|c| c.port_name().to_string()) {
+            log::info(format!("another KVM cable plugged in on {arrived}; staying on {current}"));
+            self.set_toast(
+                format!("Another KVM cable on {arrived} — pick it under KVM CABLE to switch"),
+                self.palette.accent,
+            );
+            return;
+        }
+
+        if !self.settings.auto_connect {
+            self.select_port(&arrived);
+            log::info(format!("KVM cable plugged in on {arrived}; auto-connect is off"));
+            self.set_toast(
+                format!("KVM cable found on {arrived} — press Connect"),
+                self.palette.accent,
+            );
+            return;
+        }
+        match serial_scan::choose_cable(&self.ports, &self.settings.com_port) {
+            serial_scan::CableChoice::Connect(port) => {
+                self.select_port(&port);
+                log::info(format!("KVM cable plugged in on {arrived} — auto-connecting to {port}"));
+                self.connect();
+            }
+            serial_scan::CableChoice::Ask(n) => self.ask_which_cable(n),
+            serial_scan::CableChoice::None => {}
         }
     }
 
@@ -784,13 +901,18 @@ impl KvmControlPlusApp {
         if let Some(t) = &self.input {
             t.set_capture(on);
             self.capturing = on;
+            // The local cursor freezes the moment capture starts, by design. Say
+            // so, and say how to get it back: without that it reads as a hang.
             let msg = if on {
-                "Remote session active — input captured"
+                format!(
+                    "Your mouse and keyboard now control the other computer — {} to get them back",
+                    self.leave_hint()
+                )
             } else {
-                "Local input restored"
+                "Local input restored".to_string()
             };
             self.set_toast(
-                msg.into(),
+                msg,
                 if on {
                     self.palette.accent
                 } else {
@@ -798,6 +920,166 @@ impl KvmControlPlusApp {
                 },
             );
         }
+    }
+
+    /// Start video and, when a KVM cable is connected, the keyboard and mouse
+    /// with it — the whole session from one button. By default nothing is
+    /// grabbed: the mouse works over the picture and the keyboard follows the
+    /// picture's focus, as in a remote-desktop app. Grabbing is the opt-in.
+    fn start_session(&mut self) {
+        self.start_video();
+        if self.capture.is_none() || self.cable.is_none() {
+            return;
+        }
+        if self.settings.grab_input {
+            self.set_capture(true);
+        } else {
+            self.picture_focus = true;
+            log::info("KVM ready: mouse over the picture, keyboard while the picture has focus");
+            self.set_toast(
+                "KVM ready — use the mouse over the picture; typing goes to the other \
+                 computer until you click outside it"
+                    .into(),
+                self.palette.accent,
+            );
+        }
+    }
+
+    /// Give the keyboard and mouse back, then stop the video. Never the other way
+    /// round: input must not stay captured for a picture that has gone.
+    fn stop_session(&mut self) {
+        if self.capturing {
+            self.set_capture(false);
+        }
+        self.picture_focus = false;
+        self.release_remote_pointer();
+        self.stop_video(true);
+    }
+
+    /// Lift any button still held on the remote by a press in the picture.
+    fn release_remote_pointer(&mut self) {
+        if self.remote_buttons != 0 {
+            if let Some(c) = &self.cable {
+                let (x, y) = self.last_abs.unwrap_or((0, 0));
+                c.mouse_abs_buttons(x, y, 0);
+            }
+            self.remote_buttons = 0;
+        }
+    }
+
+    /// The remote-desktop way of working, once per frame: the pointer over the
+    /// picture moves the remote pointer to the same spot (absolute, so the local
+    /// cursor stays free), presses that begin in the picture click there, the
+    /// wheel scrolls there, and the keyboard goes to the remote while the
+    /// picture has focus. `picture` is where the picture was drawn, if it was.
+    fn drive_remote_from_picture(&mut self, ctx: &egui::Context, picture: Option<egui::Rect>) {
+        let window_focused = ctx.input(|i| i.focused);
+        // In grab mode the picture only starts the grab; it never drives the
+        // remote pointer by itself.
+        let active = picture.is_some()
+            && self.cable.is_some()
+            && !self.capturing
+            && !self.settings.grab_input;
+
+        if !active || !window_focused {
+            self.release_remote_pointer();
+            if !window_focused {
+                self.picture_focus = false;
+            }
+        }
+
+        if let (true, Some(img), Some(cable)) = (active && window_focused, picture, self.cable.clone()) {
+            let (pos, held, pressed, wheel) = ctx.input(|i| {
+                let mut held = 0u8;
+                if i.pointer.primary_down() {
+                    held |= ch9329::buttons::LEFT;
+                }
+                if i.pointer.secondary_down() {
+                    held |= ch9329::buttons::RIGHT;
+                }
+                if i.pointer.middle_down() {
+                    held |= ch9329::buttons::MIDDLE;
+                }
+                let wheel: f32 = i
+                    .events
+                    .iter()
+                    .map(|e| match e {
+                        egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Page => delta.y * 3.0,
+                            egui::MouseWheelUnit::Point => delta.y / 40.0,
+                        },
+                        _ => 0.0,
+                    })
+                    .sum();
+                (i.pointer.latest_pos(), held, i.pointer.any_pressed(), wheel)
+            });
+
+            let inside = pos.is_some_and(|p| img.contains(p));
+            if pressed {
+                self.picture_focus = inside;
+            }
+
+            // A press that starts in the picture is the remote's until released,
+            // even if the drag leaves the picture; one that starts outside never is.
+            let buttons = if pressed && inside {
+                self.remote_buttons | held
+            } else {
+                self.remote_buttons & held
+            };
+
+            if let Some(p) = pos.filter(|_| inside || buttons != 0) {
+                let x = ((p.x - img.min.x) / img.width()).clamp(0.0, 1.0);
+                let y = ((p.y - img.min.y) / img.height()).clamp(0.0, 1.0);
+                let abs = ((x * 4095.0).round() as u16, (y * 4095.0).round() as u16);
+                if buttons != self.remote_buttons {
+                    cable.mouse_abs_buttons(abs.0, abs.1, buttons);
+                    self.remote_buttons = buttons;
+                    self.last_abs = Some(abs);
+                } else if self.last_abs != Some(abs) {
+                    cable.mouse_abs_move(abs.0, abs.1);
+                    self.last_abs = Some(abs);
+                }
+                if inside && wheel != 0.0 {
+                    let sign = if self.settings.invert_scroll { -1.0 } else { 1.0 };
+                    self.wheel_accum += wheel * sign;
+                    let teeth = self.wheel_accum.trunc();
+                    if teeth != 0.0 {
+                        self.wheel_accum -= teeth;
+                        cable.mouse_abs_wheel(abs.0, abs.1, teeth as i32);
+                    }
+                }
+            } else {
+                self.remote_buttons = buttons;
+            }
+        }
+
+        let kb = active && window_focused && self.picture_focus;
+        if kb != self.kb_forward {
+            if let Some(t) = &self.input {
+                t.set_keyboard_forward(kb);
+            }
+            self.kb_forward = kb;
+        }
+    }
+
+    /// Every way out of a captured session that is switched on, in words.
+    /// Ctrl+Alt+Del cannot be hooked, so it is the last resort when both the
+    /// gesture and the panic hotkey are off.
+    fn leave_hint(&self) -> String {
+        let mut ways = Vec::new();
+        match self.settings.leave_gesture {
+            crate::input::LeaveGesture::Middle => ways.push("middle-click"),
+            crate::input::LeaveGesture::CtrlAltBackspace => ways.push("press Ctrl+Alt+Backspace"),
+            crate::input::LeaveGesture::None => {}
+        }
+        if self.settings.panic_hotkey_enabled {
+            ways.push("press Ctrl+Shift+Alt+Backspace");
+        }
+        if ways.is_empty() {
+            ways.push("press Ctrl+Alt+Del");
+        }
+        ways.join(" or ")
     }
 
     fn set_toast(&mut self, text: String, color: Color32) {
@@ -976,6 +1258,9 @@ impl KvmControlPlusApp {
             match e {
                 InputEvent::LeaveRequested => {
                     log::info("leave gesture received");
+                    // The panic hotkey also works while only the keyboard is
+                    // forwarded: it hands the keyboard back.
+                    self.picture_focus = false;
                     if self.fullscreen_video {
                         self.fullscreen_video = false;
                     } else {
@@ -987,7 +1272,26 @@ impl KvmControlPlusApp {
                     self.set_toast(format!("Input capture failed: {msg}"), self.palette.bad);
                 }
                 InputEvent::DroppedWhileInactive => {}
+                InputEvent::DevicesChanged => {
+                    self.ports_rescan_at = Some(std::time::Instant::now() + PORT_RESCAN_SETTLE);
+                }
             }
+        }
+    }
+
+    /// Run the settled port rescan when it is due, and make sure the window
+    /// wakes for it: an idle window is not repainted on its own.
+    fn pump_port_rescan(&mut self, ctx: &egui::Context) {
+        let Some(at) = self.ports_rescan_at else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now >= at {
+            self.ports_rescan_at = None;
+            log::debug("device change settled — rescanning ports");
+            self.on_devices_changed();
+        } else {
+            ctx.request_repaint_after(at - now);
         }
     }
 
@@ -1031,8 +1335,11 @@ impl KvmControlPlusApp {
             };
             ui::pill(ui, &p, &vtxt, vcol);
 
+            // No ● here: the bundled fonts lack it and it drew as an empty box.
             let (ctxt, ccol) = if self.capturing {
-                ("● Capturing input", p.accent)
+                ("Input grabbed", p.accent)
+            } else if self.kb_forward {
+                ("Keyboard -> other computer", p.accent)
             } else {
                 ("Input local", p.dim)
             };
@@ -1190,52 +1497,86 @@ impl KvmControlPlusApp {
             self.save_settings();
         }
 
+        // One place to start: video and, when a cable is connected, the keyboard
+        // and mouse with it. Starting the KVM used to be a second step on the
+        // Input tab, which is easy to miss and a tab away from the picture.
         ui.horizontal(|ui| {
             if ui.button("⟳ Refresh devices").clicked() {
                 self.refresh_devices();
             }
             let live = self.capture.is_some();
-            if ui
-                .button(if live {
-                    "■ Stop video"
-                } else {
-                    "▶ Start video"
-                })
-                .clicked()
-            {
+            let has_cable = self.cable.is_some();
+            let label = match (live, has_cable) {
+                (true, _) => "■ Stop",
+                (false, true) => "▶ Start video + KVM",
+                (false, false) => "▶ Start video",
+            };
+            if ui.button(label).clicked() {
                 if live {
-                    self.stop_video(true);
+                    self.stop_session();
                 } else {
-                    self.start_video();
+                    self.start_session();
                 }
+            }
+            // Grab mode: after the leave gesture the video keeps running; this (or
+            // a click on the picture) grabs again without restarting it.
+            if live
+                && has_cable
+                && self.settings.grab_input
+                && !self.capturing
+                && ui.button("▶ Grab KVM").clicked()
+            {
+                self.set_capture(true);
             }
         });
 
-        ui.add_space(10.0);
-        self.capture_report(ui);
-
+        // The cable section sits right under Start, above the long link report:
+        // with several cables, which computer the keyboard goes to is the choice
+        // that matters most, and it must not be below the fold.
         ui.add_space(10.0);
         ui::section(ui, &p, "KVM CABLE (KEYBOARD / MOUSE)");
+        let connected = self.cable.as_ref().map(|c| c.port_name().to_string());
+        let mark = |sp: &SerialPortInfo| {
+            let mut text = sp.label();
+            if sp.is_kvm_cable {
+                text = format!("★ {text}  [KVM cable]");
+            }
+            if connected.as_deref() == Some(sp.port.as_str()) {
+                // ASCII, as with OK_MARK: the bundled fonts have no ● glyph.
+                text.push_str("  [connected]");
+            }
+            text
+        };
         let port_label = self
             .ports
             .get(self.port_sel)
-            .map(|p| p.label())
+            .map(mark)
             .unwrap_or_else(|| "(no serial port found)".into());
+        let mut port_pick: Option<usize> = None;
         egui::ComboBox::from_id_salt("port")
             .selected_text(port_label)
             .width(ui.available_width() - 8.0)
             .show_ui(ui, |ui| {
                 for (i, sp) in self.ports.iter().enumerate() {
-                    let text = if sp.is_kvm_cable {
-                        format!("★ {}  [KVM cable]", sp.label())
-                    } else {
-                        sp.label()
-                    };
-                    if ui.selectable_label(self.port_sel == i, text).clicked() {
-                        self.port_sel = i;
+                    if ui.selectable_label(self.port_sel == i, mark(sp)).clicked() {
+                        port_pick = Some(i);
                     }
                 }
             });
+        // Picking a cable is the decision: connect to it (switching away from
+        // the current one) rather than waiting for a second click on Connect.
+        if let Some(i) = port_pick {
+            self.port_sel = i;
+            let picked = self.ports[i].port.clone();
+            if connected.as_deref() != Some(picked.as_str()) {
+                log::info(format!("cable picked: {picked} — connecting"));
+                let was_capturing = self.capturing;
+                self.connect();
+                if was_capturing && self.cable.is_some() {
+                    self.set_capture(true);
+                }
+            }
+        }
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("Baud").color(p.dim).size(12.0));
@@ -1329,20 +1670,46 @@ impl KvmControlPlusApp {
                         self.set_toast("No reply to GET_PARA_CFG".into(), p.warn);
                     }
                 }
+                // The answer to "are my keys arriving?" that needs no picture:
+                // the target's own Caps Lock LED, read back through the chip.
+                // Blocks the window for under a second; it is a deliberate click.
+                if ui
+                    .button("Test keys (taps Caps Lock twice on the other computer)")
+                    .clicked()
+                {
+                    let check = cable.caps_lock_round_trip();
+                    let color = if check.keys_arrive() { p.ok } else { p.bad };
+                    self.set_toast(check.verdict(), color);
+                }
             });
         }
+
+        ui.add_space(10.0);
+        self.capture_report(ui);
     }
 
     fn tab_input(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
 
         ui::section(ui, &p, "SESSION");
+        if ui::toggle(
+            ui,
+            &p,
+            "Grab mouse & keyboard",
+            &mut self.settings.grab_input,
+            "Off (default): the mouse works over the picture and your cursor stays \
+             free, like a remote-desktop app. On: Start grabs the mouse and keyboard \
+             for the whole session (relative mouse, for games and full-screen apps) \
+             until the leave gesture.",
+        ) {
+            self.save_settings();
+        }
         let has_cable = self.cable.is_some();
         ui.add_enabled_ui(has_cable, |ui| {
             let label = if self.capturing {
-                "■ End session (release input)"
+                "■ Release mouse & keyboard"
             } else {
-                "▶ Start session (capture input)"
+                "▶ Grab mouse & keyboard now"
             };
             if ui
                 .add_sized([ui.available_width(), 30.0], egui::Button::new(label))
@@ -1917,6 +2284,38 @@ impl KvmControlPlusApp {
 
     fn video_central(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
+        let mut take_control = false;
+        let mut picture: Option<egui::Rect> = None;
+        // What the picture must say over itself. While grabbed, the local cursor
+        // is frozen and a black remote screen shows nothing moving either — this
+        // banner is then the only sign of what happened and how to get out.
+        let mut banner: Vec<String> = Vec::new();
+        if self.capturing {
+            banner.push(format!(
+                "Controlling the other computer — {} to get your mouse back",
+                self.leave_hint()
+            ));
+        } else if self.cable.is_some() && self.settings.grab_input {
+            banner.push("Click the picture to grab the mouse and keyboard".into());
+        } else if self.cable.is_some() && self.picture_focus {
+            banner.push(
+                "Mouse and keyboard go to the other computer — click outside the picture \
+                 to type here"
+                    .into(),
+            );
+        } else if self.cable.is_some() {
+            banner.push(
+                "The mouse works over the picture — click it to type on the other computer"
+                    .into(),
+            );
+        }
+        if self.picture_stats.as_ref().is_some_and(|s| s.y_max <= 20) {
+            banner.push(
+                "The other computer's screen is black: asleep, switched off, or no HDMI \
+                 signal. A key press or mouse move while in control wakes a sleeping one."
+                    .into(),
+            );
+        }
         egui::Frame::default()
             .fill(Color32::BLACK)
             .corner_radius(egui::CornerRadius::same(9))
@@ -1933,8 +2332,10 @@ impl KvmControlPlusApp {
                             w = h * aspect;
                         }
                         let size = egui::vec2(w, h);
-                        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+                        let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click());
                         let img = egui::Rect::from_center_size(rect.center(), size);
+                        take_control = response.clicked();
+                        picture = Some(img);
                         ui.painter().image(
                             tex.id(),
                             img,
@@ -1952,6 +2353,29 @@ impl KvmControlPlusApp {
                             egui::FontId::monospace(11.0),
                             Color32::from_rgb(200, 210, 220),
                         );
+                        // Bottom-centre banner, one line per message, on a dark
+                        // plate so it reads over any picture.
+                        let mut bottom = img.center_bottom() - egui::vec2(0.0, 14.0);
+                        for line in banner.iter().rev() {
+                            let galley = ui.painter().layout(
+                                line.clone(),
+                                egui::FontId::proportional(14.0),
+                                Color32::WHITE,
+                                (img.width() - 40.0).max(120.0),
+                            );
+                            let plate = egui::Rect::from_center_size(
+                                bottom - egui::vec2(0.0, galley.size().y / 2.0 + 6.0),
+                                galley.size() + egui::vec2(20.0, 12.0),
+                            );
+                            ui.painter().rect_filled(
+                                plate,
+                                egui::CornerRadius::same(8),
+                                Color32::from_black_alpha(190),
+                            );
+                            ui.painter()
+                                .galley(plate.min + egui::vec2(10.0, 6.0), galley, Color32::WHITE);
+                            bottom.y = plate.min.y - 6.0;
+                        }
                     }
                     _ => {
                         let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
@@ -1962,6 +2386,11 @@ impl KvmControlPlusApp {
                                  USB capture cable and press Refresh devices."
                                     .to_string()
                             }
+                            None if self.cable.is_some() => "Video stopped.\n\nPress “Start video \
+                                 + KVM” on the Devices tab: the picture starts, the mouse \
+                                 works over it, and your typing goes to the other computer \
+                                 until you click outside the picture."
+                                .to_string(),
                             None => "Video stopped.\n\nPress “Start video” on the Devices tab."
                                 .to_string(),
                         };
@@ -1975,6 +2404,12 @@ impl KvmControlPlusApp {
                     }
                 }
             });
+        if take_control && self.settings.grab_input && self.cable.is_some() && !self.capturing {
+            log::info("picture clicked — grabbing input for the other computer");
+            self.set_capture(true);
+        }
+        let ctx = ui.ctx().clone();
+        self.drive_remote_from_picture(&ctx, picture);
         let _ = p;
     }
 }
@@ -1984,6 +2419,7 @@ impl eframe::App for KvmControlPlusApp {
         let ctx = ui.ctx().clone();
 
         self.pump_input_events();
+        self.pump_port_rescan(&ctx);
         self.pump_video(&ctx);
 
         // Focus loss safety: stop capturing if the user switched away.
@@ -2063,6 +2499,11 @@ fn level_color(p: &Palette, level: Level) -> Color32 {
         Level::Error => p.bad,
     }
 }
+
+/// How long Windows' device-change messages must stay quiet before the ports are
+/// rescanned. One plug-in sends a burst (the USB device, then its driver, then
+/// the COM port), and the port only exists at the end of it.
+const PORT_RESCAN_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Look at the USB bus for either end of the cable and say why `ports` has no
 /// KVM cable in it — logged as well as returned, so `last-run.log` carries it.

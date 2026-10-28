@@ -53,6 +53,10 @@ pub struct Settings {
     pub release_on_focus_loss: bool,
     /// Hotkey (Ctrl+Shift+Alt+…) that instantly ends capture. Always available.
     pub panic_hotkey_enabled: bool,
+    /// Grab the mouse and keyboard for the whole session (relative mouse, local
+    /// cursor frozen, a gesture to leave). Off by default: the mouse then works
+    /// over the picture like a remote-desktop app, and the local cursor stays free.
+    pub grab_input: bool,
 
     /// `"dark"` or `"light"`.
     pub theme: String,
@@ -102,6 +106,7 @@ impl Default for Settings {
             leave_gesture: LeaveGesture::Middle,
             release_on_focus_loss: true,
             panic_hotkey_enabled: true,
+            grab_input: false,
             theme: "dark".into(),
             log_level: "info".into(),
             show_left_pane: true,
@@ -192,6 +197,7 @@ impl Settings {
             "panic_hotkey",
             &self.panic_hotkey_enabled.to_string(),
         );
+        kv(&mut out, "grab_input", &self.grab_input.to_string());
         out.push_str("\n[session]\n");
         kv(
             &mut out,
@@ -263,6 +269,7 @@ impl Settings {
                 "leave_gesture" => s.leave_gesture = LeaveGesture::parse(&v),
                 "release_on_focus_loss" => s.release_on_focus_loss = parse_bool(&v),
                 "panic_hotkey" => s.panic_hotkey_enabled = parse_bool(&v),
+                "grab_input" => s.grab_input = parse_bool(&v),
                 "fullscreen_on_open" => s.fullscreen_on_open = parse_bool(&v),
                 "theme" => s.theme = v,
                 "log_level" => s.log_level = v,

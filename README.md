@@ -192,7 +192,7 @@ never break the build.
 
 ```sh
 cargo build --release      # target/release/KVM-Control-Plus.exe
-cargo test                 # 85 tests
+cargo test                 # 88 tests
 ```
 
 Requires the MSVC toolchain (Rust 1.93 + VS 2022 verified). The `windows` crate
@@ -222,6 +222,45 @@ the top bar shows an amber **"No KVM cable — why?"** badge whose tooltip, the 
 under the port picker and `--list-ports` all say the cable is plugged in
 backwards. A serial end with no driver (no COM port) and nothing plugged in at all
 are told apart the same way.
+
+**One button starts the whole session, and nothing is grabbed.** With a KVM cable
+connected, the Devices tab's button reads **▶ Start video + KVM**. It works like a
+remote-desktop app (RustDesk and the like): your cursor stays free, and over the
+picture it moves the other computer's pointer to the same spot — absolute
+positions, so the two cursors agree. A click or the wheel inside the picture goes
+to the other computer; a drag that starts in the picture keeps going there until
+you let go. The keyboard follows the picture's focus: after Start, or a click in
+the picture, typing goes to the other computer; a click anywhere else in the
+window, or switching to another window, brings it back here (and releases every
+key on the other side, so none stays held). A banner on the picture says which
+way input is going, and another says when the other computer's screen is
+entirely black. **■ Stop** hands everything back before it stops the video.
+
+**Grabbing is optional.** *Input → Grab mouse & keyboard* switches to the old
+behaviour for games and full-screen apps: Start then captures the keyboard and a
+relative mouse, your own cursor freezes, and a banner names the way back
+(middle-click by default, or Ctrl+Shift+Alt+Backspace). **▶ Grab KVM** or a click
+on the picture grabs again after leaving.
+
+**Several KVM cables.** The cable list sits right under Start and names each
+cable's USB socket ("USB-SERIAL CH340 (COM8) — USB port 2, hub 7"), so two
+identical cables can be told apart; the connected one is marked. Picking a cable
+connects to it straight away, switching from the current one. At startup the app
+reconnects the cable used last time, or the only one there; with several and none
+used before it asks rather than guessing, since a guess would put your keyboard on
+the wrong computer. A cable plugged in while another is connected never takes over.
+
+**Are my keys arriving?** *Test keys* in the cable's status card (or `--key-test`)
+taps Caps Lock twice on the other computer and reads its Caps Lock LED back
+through the chip. The LED is set by the other computer's own OS, so a change
+proves the whole key path without needing a picture.
+
+**Plugging the cable in or out needs no button.** Windows tells the app when a
+device comes or goes; half a second after the last such message it rescans the
+ports. A KVM cable that has just appeared is connected (with *Auto-connect* on,
+by the same rule as at startup), and a connected one that has been pulled out is
+released — which also hands your keyboard and mouse back, since they would
+otherwise still be captured for a remote that can no longer receive them.
 
 **Hide pane** in the top bar collapses the controls for a video-only window, which is
 what you want once a session is running; the choice is remembered in the settings file
@@ -263,6 +302,7 @@ capture problem was diagnosed in the first place:
 | `--list-devices` | video capture devices |
 | `--list-formats <n>` | every native format of device *n* |
 | `--list-ports` | serial ports, with reasons when empty |
+| `--key-test [COM]` | Caps Lock twice on the target, LED read back: do keys arrive? |
 | `--probe <n>` | open device *n* through MediaFoundation |
 | `--usb` | **measured** USB link speed + the bandwidth arithmetic |
 | `--snapshot <out.bmp> [n]` | save a frame (waits for a non-black one) |

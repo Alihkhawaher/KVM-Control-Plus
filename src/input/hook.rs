@@ -12,6 +12,7 @@
 //! | `WH_KEYBOARD_LL`          | reads keys *and* swallows them (they go remote)     |
 //! | `WH_MOUSE_LL`             | freezes the local cursor, detects the leave gesture |
 //! | Raw Input (`WM_INPUT`)    | true relative movement, unbounded by screen edges   |
+//! | `WM_DEVICECHANGE`         | tells the app a KVM cable came or went              |
 //!
 //! Nothing is recorded or stored — every event is translated to a HID report and
 //! handed straight to the CH9329 link.
@@ -37,7 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
     LLKHF_UP, MSG, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN,
     RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP,
-    RI_MOUSE_WHEEL, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
+    RI_MOUSE_WHEEL, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_DEVICECHANGE, WM_INPUT,
     WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
@@ -59,12 +61,19 @@ pub enum InputEvent {
     DroppedWhileInactive,
     /// The input thread hit a fatal error and stopped.
     Failed(String),
+    /// Windows broadcast `WM_DEVICECHANGE`: something was plugged in, pulled out
+    /// or got its driver. Arrives in bursts; the app settles before rescanning.
+    DevicesChanged,
 }
 
 /// Everything shared between the hook callbacks and the owner.
 struct Shared {
     cable: std::sync::Mutex<Option<Arc<Cable>>>,
+    /// Grab: keyboard *and* mouse go to the remote, the local cursor is frozen.
     remote: AtomicBool,
+    /// Keyboard only, the local mouse untouched: the default way of working,
+    /// switched on while the picture has focus.
+    keyboard: AtomicBool,
     layout_aware: AtomicBool,
     mouse_speed_bits: AtomicU32,
     invert_scroll: AtomicBool,
@@ -79,6 +88,9 @@ struct Shared {
     /// Buttons currently held.
     buttons: AtomicU8,
     events: Sender<InputEvent>,
+    /// Wakes the GUI after an event that must not wait for the next repaint — an
+    /// idle window is not repainted, so a queued event could otherwise sit unread.
+    wake: Box<dyn Fn() + Send + Sync>,
 }
 
 // One input thread at a time, reachable from the `extern "system"` hook procs.
@@ -93,11 +105,17 @@ pub struct InputThread {
 
 impl InputThread {
     /// Start the input thread: it creates its window, installs the hooks, and
-    /// runs a message pump until [`InputThread::stop`].
-    pub fn start(events: Sender<InputEvent>, gesture: LeaveGesture) -> Result<InputThread, String> {
+    /// runs a message pump until [`InputThread::stop`]. `wake` is called after
+    /// posting an event the GUI must see while idle (a device change).
+    pub fn start(
+        events: Sender<InputEvent>,
+        gesture: LeaveGesture,
+        wake: Box<dyn Fn() + Send + Sync>,
+    ) -> Result<InputThread, String> {
         let shared = Arc::new(Shared {
             cable: std::sync::Mutex::new(None),
             remote: AtomicBool::new(false),
+            keyboard: AtomicBool::new(false),
             layout_aware: AtomicBool::new(true),
             mouse_speed_bits: AtomicU32::new(1.0f32.to_bits()),
             invert_scroll: AtomicBool::new(false),
@@ -109,6 +127,7 @@ impl InputThread {
             modifiers: AtomicU8::new(0),
             buttons: AtomicU8::new(0),
             events,
+            wake,
         });
 
         if SHARED.get().is_some() {
@@ -166,6 +185,26 @@ impl InputThread {
 
     pub fn is_capturing(&self) -> bool {
         self.shared.remote.load(Ordering::SeqCst)
+    }
+
+    /// Forward the keyboard (only) to the remote, leaving the mouse local. Turning
+    /// it off releases every key on the remote, so none can stay held there.
+    pub fn set_keyboard_forward(&self, on: bool) {
+        let was = self.shared.keyboard.swap(on, Ordering::SeqCst);
+        if was == on {
+            return;
+        }
+        log::debug(if on {
+            "keyboard → remote (picture has focus)"
+        } else {
+            "keyboard → local"
+        });
+        if !on && !self.shared.remote.load(Ordering::SeqCst) {
+            self.shared.modifiers.store(0, Ordering::Relaxed);
+            if let Some(c) = self.shared.cable.lock().unwrap().as_ref() {
+                c.release_all_keys();
+            }
+        }
     }
 
     pub fn set_layout_aware(&self, on: bool) {
@@ -248,6 +287,9 @@ fn thread_main(shared: Arc<Shared>) -> Result<HWND, String> {
         // A zero return means "already registered", which is fine.
         RegisterClassW(&wc);
 
+        // Top-level (no parent, not HWND_MESSAGE) on purpose: only top-level
+        // windows receive the WM_DEVICECHANGE broadcasts that tell the app a KVM
+        // cable was plugged in or pulled out. A message-only window never would.
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class_name,
@@ -330,6 +372,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         }
         return LRESULT(0);
     }
+    if msg == WM_DEVICECHANGE {
+        // Every kind is forwarded (DBT_DEVNODES_CHANGED, the port arrival and
+        // removal broadcasts): the app rescans after the burst settles, so it
+        // does not matter which of them names the change.
+        if let Some(shared) = SHARED.get() {
+            log::trace(format!("WM_DEVICECHANGE wparam=0x{:04X}", wparam.0));
+            let _ = shared.events.send(InputEvent::DevicesChanged);
+            (shared.wake)();
+        }
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -344,7 +396,8 @@ extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     let Some(shared) = SHARED.get() else {
         return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
     };
-    if !shared.remote.load(Ordering::Relaxed) {
+    let grab = shared.remote.load(Ordering::Relaxed);
+    if !grab && !shared.keyboard.load(Ordering::Relaxed) {
         return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
     }
 
@@ -368,6 +421,10 @@ extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     }
 
     let Some(cable) = shared.cable.lock().unwrap().clone() else {
+        if !grab {
+            // Keyboard-only forwarding with no cable: never eat the user's keys.
+            return unsafe { CallNextHookEx(None, ncode, wparam, lparam) };
+        }
         let _ = shared.events.send(InputEvent::DroppedWhileInactive);
         return LRESULT(1);
     };

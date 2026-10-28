@@ -79,6 +79,10 @@ struct HidState {
 struct SenderCtx {
     port: Arc<SerialPort>,
     pending: Mutex<(i32, i32)>,
+    /// Newest absolute pointer position not yet written. Only the newest counts:
+    /// at 9600 baud the link carries ~70 frames a second, fewer than a mouse
+    /// produces, and a backlog of stale positions would only add lag.
+    pending_abs: Mutex<Option<(u16, u16)>>,
     /// Held for the duration of every port write so the sender thread and a
     /// UI-initiated request/response exchange can never interleave frames.
     io: Mutex<()>,
@@ -126,6 +130,7 @@ impl Cable {
         let ctx = Arc::new(SenderCtx {
             port,
             pending: Mutex::new((0, 0)),
+            pending_abs: Mutex::new(None),
             io: Mutex::new(()),
             buttons: std::sync::atomic::AtomicU8::new(0),
             stats: LinkStats::default(),
@@ -281,6 +286,35 @@ impl Cable {
         let _ = self.tx.send(Msg::Nudge);
     }
 
+    /// Move the pointer to `(x, y)` in the chip's absolute space (0..=4095 on each
+    /// axis, the whole target screen). Coalesced: the sender writes the newest.
+    pub fn mouse_abs_move(&self, x: u16, y: u16) {
+        *self.ctx.pending_abs.lock().unwrap() = Some((x, y));
+        let _ = self.tx.send(Msg::Nudge);
+    }
+
+    /// Change the held buttons at an absolute position. Never coalesced: it goes
+    /// out in order with every other report, so a click lands where it was made.
+    pub fn mouse_abs_buttons(&self, x: u16, y: u16, buttons: u8) {
+        self.state.lock().unwrap().buttons = buttons;
+        self.ctx.buttons.store(buttons, Ordering::Relaxed);
+        // This frame carries the newest position; an older pending one written
+        // after it would drag the pointer back.
+        *self.ctx.pending_abs.lock().unwrap() = None;
+        self.send_bytes(&p::mouse_abs_frame(buttons, x, y, 0));
+    }
+
+    /// Wheel notches at an absolute position (positive = away from the user).
+    pub fn mouse_abs_wheel(&self, x: u16, y: u16, teeth: i32) {
+        let buttons = self.mouse_buttons();
+        let mut remaining = teeth;
+        while remaining != 0 {
+            let step = remaining.clamp(-127, 127) as i8;
+            remaining -= step as i32;
+            self.send_bytes(&p::mouse_abs_frame(buttons, x, y, step));
+        }
+    }
+
     /// Set the mouse button state (bit0 left, bit1 right, bit2 middle).
     pub fn set_mouse_buttons(&self, buttons: u8) {
         self.state.lock().unwrap().buttons = buttons;
@@ -339,11 +373,50 @@ impl Cable {
     fn round_trip(&self, cmd: u8, timeout_ms: u32) -> Option<Vec<u8>> {
         let frame = p::build_frame(cmd, &[]);
         let _io = self.ctx.io.lock().unwrap();
+        // The chip acknowledges every report it is sent (`57 AB 00 82 01 00 …`),
+        // and nothing reads those while streaming. Without this the first frame
+        // read back would be a stale acknowledgement, not the reply asked for.
+        self.ctx.port.purge_input();
         if self.ctx.port.write_all(&frame).is_err() {
             return None;
         }
-        let reply = read_frame(&self.ctx.port, timeout_ms)?;
-        p::parse_frame(&reply, cmd).map(|payload| payload.to_vec())
+        // An acknowledgement still in flight can land ahead of the reply: skip
+        // anything that is not an answer to `cmd`, a few frames at most.
+        for _ in 0..8 {
+            let reply = read_frame(&self.ctx.port, timeout_ms)?;
+            if let Some(payload) = p::parse_frame(&reply, cmd) {
+                return Some(payload.to_vec());
+            }
+            log::trace(format!("round trip 0x{cmd:02X}: skipped {reply:02X?}"));
+        }
+        None
+    }
+
+    /// Prove that key presses reach the target, with no picture needed: tap Caps
+    /// Lock, read the target's Caps Lock LED back through GET_INFO, then tap it
+    /// again to put it back. The LED is set by the **target's own OS** when it
+    /// acts on the key, so a change is end-to-end proof; no change means the key
+    /// went nowhere (or the target ignores lock keys).
+    pub fn caps_lock_round_trip(&self) -> CapsCheck {
+        let settle = Duration::from_millis(400);
+        let tap = |cable: &Cable| {
+            cable.key_down(p::hid::CAPSLOCK, 0);
+            cable.key_up(p::hid::CAPSLOCK, 0);
+        };
+        let before = self.query_info();
+        tap(self);
+        thread::sleep(settle);
+        let toggled = self.query_info();
+        tap(self);
+        thread::sleep(settle);
+        let restored = self.query_info();
+        let check = CapsCheck {
+            before,
+            toggled,
+            restored,
+        };
+        log::info(format!("caps lock round trip on {}: {}", self.port_name(), check.verdict()));
+        check
     }
 
     // ---------------- plumbing ----------------
@@ -374,6 +447,55 @@ impl Drop for Cable {
     }
 }
 
+/// What [`Cable::caps_lock_round_trip`] saw: the chip's status before, after one
+/// Caps Lock tap, and after the second tap that puts it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapsCheck {
+    pub before: Option<ChipInfo>,
+    pub toggled: Option<ChipInfo>,
+    pub restored: Option<ChipInfo>,
+}
+
+impl CapsCheck {
+    /// True only when the target visibly acted on the key.
+    pub fn keys_arrive(&self) -> bool {
+        matches!((self.before, self.toggled), (Some(b), Some(t)) if b.caps_lock != t.caps_lock)
+    }
+
+    /// The finding in words, naming the step that failed.
+    pub fn verdict(&self) -> String {
+        let caps = |i: Option<ChipInfo>| match i {
+            Some(i) => if i.caps_lock { "on" } else { "off" },
+            None => "no reply",
+        };
+        let trail = format!(
+            "Caps Lock {} -> {} -> {}",
+            caps(self.before),
+            caps(self.toggled),
+            caps(self.restored)
+        );
+        match (self.before, self.toggled, self.restored) {
+            (None, _, _) => format!("the chip did not answer GET_INFO, nothing tested ({trail})"),
+            (Some(b), _, _) if !b.usb_connected => format!(
+                "the CH9329 says the target has not enumerated it: its USB end is not \
+                 plugged into a running computer ({trail})"
+            ),
+            (_, None, _) => format!("the chip stopped answering after the key ({trail})"),
+            _ if self.keys_arrive() => {
+                let back = matches!((self.before, self.restored), (Some(b), Some(r)) if b.caps_lock == r.caps_lock);
+                format!(
+                    "keys reach the target: its Caps Lock changed and {} ({trail})",
+                    if back { "was put back" } else { "may need one more press to put back" }
+                )
+            }
+            _ => format!(
+                "the key did not reach the target: its Caps Lock never changed, so the \
+                 target ignored the report or never received it ({trail})"
+            ),
+        }
+    }
+}
+
 /// The sender thread: writes queued frames, then drains accumulated movement.
 fn sender_loop(rx: Receiver<Msg>, ctx: Arc<SenderCtx>) {
     let mut buf = [0u8; MAX_FRAME];
@@ -391,6 +513,7 @@ fn sender_loop(rx: Receiver<Msg>, ctx: Arc<SenderCtx>) {
 
         // Drain whatever movement accumulated while we were blocked.
         drain_movement(&ctx, &mut buf);
+        drain_abs(&ctx, &mut buf);
 
         // Drop the chip's replies once nothing else is queued, so its buffer
         // cannot fill up during a long streaming session.
@@ -422,6 +545,17 @@ fn drain_movement(ctx: &Arc<SenderCtx>, buf: &mut [u8; MAX_FRAME]) {
         write_all(ctx, &buf[..n]);
         ctx.stats.moves_sent.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Write the newest absolute position, if one is waiting, with the held buttons.
+fn drain_abs(ctx: &Arc<SenderCtx>, buf: &mut [u8; MAX_FRAME]) {
+    let Some((x, y)) = ctx.pending_abs.lock().unwrap().take() else {
+        return;
+    };
+    let buttons = ctx.buttons.load(Ordering::Relaxed);
+    let n = p::build_frame_into(buf, p::cmd::MS_ABS, &p::mouse_abs_report(buttons, x, y, 0));
+    write_all(ctx, &buf[..n]);
+    ctx.stats.moves_sent.fetch_add(1, Ordering::Relaxed);
 }
 
 fn write_all(ctx: &Arc<SenderCtx>, bytes: &[u8]) {
